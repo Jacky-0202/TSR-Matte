@@ -58,8 +58,10 @@ The following diagram illustrates the data flow in TSR-Matte:
 **Step 1: Install PyTorch (Example for CUDA 12.6)**
 ```bash
 # Please visit pytorch.org to get the command matching your environment
-pip3 install torch torchvision --index-url [download](https://pytorch.org/get-started/locally/)
+pip3 install torch torchvision
 ```
+
+[download](https://pytorch.org/get-started/locally/)
 
 **Step 2: Install other dependencies**
 
