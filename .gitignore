@@ -1,0 +1,22 @@
+# Python 快取
+__pycache__/
+*.pyc
+
+# 虛擬環境
+.venv/
+venv/
+env/
+
+# IDE 設定
+.vscode/
+.idea/
+
+# 訓練產出的檔案 (不要上傳大檔案)
+checkpoints/
+
+# 測試結果 (讓使用者自己跑 predict.py 產生)
+test_data/
+test_results/
+
+# 系統檔案
+.DS_Store

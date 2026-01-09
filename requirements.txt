@@ -1,0 +1,8 @@
+timm
+tqdm
+h5py
+numpy
+pandas
+pillow
+matplotlib
+opencv-python
