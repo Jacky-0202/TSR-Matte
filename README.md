@@ -61,8 +61,6 @@ The following diagram illustrates the data flow in TSR-Matte:
 pip3 install torch torchvision
 ```
 
-[download](https://pytorch.org/get-started/locally/)
-
 **Step 2: Install other dependencies**
 
 ```bash
@@ -130,10 +128,5 @@ Results (Alpha Matte) will be saved in test_results/.
 
 This project is built upon the insights and architectures of the following excellent works:
 
-- Swin Transformer: Official Repo | Paper
-Liu, Z., Lin, Y., Cao, Y., Hu, H., Wei, Y., Zhang, Z., Lin, S., & Guo, B. (2021). Swin Transformer: Hierarchical Vision Transformer using Shifted Windows.
-
-- InSPyReNet: Official Repo | Paper
-Kim, T., Lee, H., & Kim, D. (2022). InSPyReNet: Image Matting w/ High-Resolution Refinement.
-
-
+- [Swin Transformer](https://arxiv.org/pdf/2103.14030)
+- [InSPyReNet](https://arxiv.org/pdf/2209.09475)
