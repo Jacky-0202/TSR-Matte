@@ -41,7 +41,7 @@
 
 The following diagram illustrates the data flow in TSR-Matte:
 
-![Architecture Diagram](figures/tsr architecture.png)
+![Architecture Diagram](figures/tsr_architecture.png)
 
 ---
 
