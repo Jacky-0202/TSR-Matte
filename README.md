@@ -2,6 +2,8 @@
 
 **TSR-Matte** (Twin-Swin-Refiner) is a high-performance image matting architecture designed to handle high-resolution inputs with precise edge details. It combines the semantic understanding of a **Swin Transformer** (Twin-Encoder) with a lightweight, high-resolution **Dilated Refiner**.
 
+![Compare](figures/Compare_Mathod.png)
+
 ---
 ## Comparison: TwinSwin-Matte vs. TSR-Matte (Swin Tiny):
 
