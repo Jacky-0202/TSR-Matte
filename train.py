@@ -1,255 +1,223 @@
+# train.py
+
 import os
-import time
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
+import numpy as np
 
-# --- Import Custom Modules ---
+# Import Custom Modules
 import config
-from models.tsr_matte import TSRMatteNet 
+from utils.dataset import DIS5KDataset
 
-from utils.dataset import MattingDataset
+# Import from the new TSR-Net file
+from models.tsr_net import TSRNet 
+from models.mask_encoder import SwinMaskEncoder
 from utils.loss import MattingLoss
-from utils.metrics import calculate_matting_metrics
 from utils.logger import CSVLogger
+from utils.metrics import calculate_matting_metrics
 from utils.plot import plot_history
 
-def get_dataloaders():
-    print(f"📂 Dataset Root: {config.DATASET_ROOT}")
-    
-    train_ds = MattingDataset(
-        root_dir=config.DATASET_ROOT,
-        mode='train',
-        img_size=config.IMG_SIZE
-    )
-    
-    val_ds = MattingDataset(
-        root_dir=config.DATASET_ROOT,
-        mode='val',
-        img_size=config.IMG_SIZE
-    )
+def train():
+    # --- 1. Setup ---
+    print(f"🚀 Starting training: {config.EXPERIMENT_NAME}")
+    print(f"   Device: {config.DEVICE}")
+    print(f"   Input Size: {config.IMG_SIZE}x{config.IMG_SIZE}")
+    print(f"   Dilation: {config.DILATE_MASK} (Should be False for Refiner)")
+    print(f"   Twin Alignment: {config.USE_TWIN_ALIGNMENT}")
 
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=config.NUM_WORKERS, 
-        pin_memory=config.PIN_MEMORY
-    )
+    # Create directories
+    logger = CSVLogger(config.LOG_DIR)
     
-    # Validation Batch Size must be 1
-    val_loader = DataLoader(
-        val_ds, 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=config.NUM_WORKERS, 
-        pin_memory=config.PIN_MEMORY
-    )
-    
-    return train_loader, val_loader
+    # --- 2. Data Loading ---
+    print("📂 Loading Datasets...")
+    # [Matting Update] Dilation is OFF for high-precision training
+    train_ds = DIS5KDataset(config.DATASET_ROOT, mode='train', 
+                            target_size=config.IMG_SIZE, dilate_mask=config.DILATE_MASK)
+    val_ds = DIS5KDataset(config.DATASET_ROOT, mode='val', 
+                          target_size=config.IMG_SIZE, dilate_mask=False)
 
-def build_model_and_optimizer(device):
-    print(f"🏗️ Building Model: TSRMatteNet ({config.BACKBONE})...")
-    
-    # [UPDATED] Use TSRMatteNet
-    model = TSRMatteNet(
-        n_classes=config.NUM_CLASSES,
-        img_size=config.IMG_SIZE,
-        backbone_name=config.BACKBONE,
-        pretrained=True
-    ).to(device)
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, 
+                              shuffle=True, num_workers=config.NUM_WORKERS, 
+                              pin_memory=config.PIN_MEMORY)
+    val_loader = DataLoader(val_ds, batch_size=1, 
+                            shuffle=False, num_workers=config.NUM_WORKERS, 
+                            pin_memory=config.PIN_MEMORY)
 
-    # --- Optimizer Setup ---
-    # LM Encoder (Student & Teacher) parameters
-    img_enc_ids = list(map(id, model.img_encoder.parameters()))
-    gt_enc_ids = list(map(id, model.gt_encoder.parameters()))
-    
-    # Decoder & Refiner parameters (Everything else)
-    decoder_params = filter(lambda p: id(p) not in img_enc_ids and id(p) not in gt_enc_ids, model.parameters())
+    print(f"   Train Images: {len(train_ds)}")
+    print(f"   Val Images: {len(val_ds)}")
 
-    optimizer = optim.AdamW([
-        {'params': decoder_params, 'lr': config.LEARNING_RATE},           # Decoder/Refiner: Normal LR
-        {'params': model.img_encoder.parameters(), 'lr': config.LEARNING_RATE * 0.1} # Backbone: 0.1x LR
-    ], weight_decay=1e-3)
+    # --- 3. Model Initialization ---
+    print(f"🔹 Initializing TSR-Net (Student + Refiner): {config.BACKBONE_NAME}")
+    model = TSRNet(n_classes=1, img_size=config.IMG_SIZE, 
+                         backbone_name=config.BACKBONE_NAME).to(config.DEVICE)
+    
+    # B. Teacher Model
+    teacher = None
+    if config.USE_TWIN_ALIGNMENT:
+        # Get embed_dim dynamically from the Student model
+        student_embed_dim = model.dims[0]
+        print(f"🎓 Initializing Teacher (Mask Encoder) with embed_dim={student_embed_dim}...")
+        teacher = SwinMaskEncoder(embed_dim=student_embed_dim).to(config.DEVICE)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False 
 
-    # --- Loss Function ---
-    # weight_grad=1.0 ensures we train for edge sharpness
-    criterion = MattingLoss(
-        weight_bce=1.0, weight_l1=1.0, weight_ssim=0.5, weight_iou=0.5, weight_grad=2.0, weight_feat=0.2
-    ).to(device)
+    # --- 4. Optimization ---
+    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
     
-    # --- Scheduler ---
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer, 
-        T_0=config.SCHEDULER_T0, 
-        T_mult=config.SCHEDULER_T_MULT, 
-        eta_min=config.SCHEDULER_ETA_MIN
-    )
+    scaler = torch.amp.GradScaler('cuda') 
     
-    return model, optimizer, criterion, scheduler
+    # [Auto Config] This will load weights from config.LOSS_WEIGHTS
+    loss_fn = MattingLoss(**config.LOSS_WEIGHTS).to(config.DEVICE)
 
-def train_one_epoch(loader, model, optimizer, criterion, scaler, device, epoch):
-    model.train()
-    
-    # Accumulators
-    avg_loss = 0
-    avg_mse = 0
-    avg_sad = 0
-    avg_grad = 0
-    avg_acc = 0
-    
-    # [PRINT] Print LR explicitly before the progress bar
-    current_scale = model.res_scale.item()
-    current_lr = optimizer.param_groups[0]['lr']
-    print(f"\n🔵 Epoch {epoch} | Current LR: {current_lr:.2e} | Current Scale:{current_scale:.3f}")
-    
-    # [TQDM] Progress bar
-    loop = tqdm(loader, desc="   Train", leave=True)
-    
-    for batch_idx, (images, masks) in enumerate(loop):
-        images = images.to(device)
-        masks = masks.to(device)
-        
-        optimizer.zero_grad(set_to_none=True)
-        
-        with torch.amp.autocast('cuda'):
-            # Forward pass using TSRMatteNet
-            pred_alpha, img_feats, gt_feats = model(images, gt_mask=masks)
-            loss, loss_l1, loss_detail, loss_feat = criterion(pred_alpha, masks, img_feats, gt_feats)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        scaler.step(optimizer)
-        scaler.update()
-        
-        # Metrics
-        mse, sad, grad, acc = calculate_matting_metrics(pred_alpha, masks)
-        
-        # Update Averages
-        avg_loss = (avg_loss * batch_idx + loss.item()) / (batch_idx + 1)
-        avg_mse = (avg_mse * batch_idx + mse) / (batch_idx + 1)
-        avg_sad = (avg_sad * batch_idx + sad) / (batch_idx + 1)
-        avg_grad = (avg_grad * batch_idx + grad) / (batch_idx + 1)
-        avg_acc = (avg_acc * batch_idx + acc) / (batch_idx + 1)
-        
-        # Update TQDM - Only show Loss and Acc
-        loop.set_postfix(
-            loss=f"{avg_loss:.4f}",
-            acc=f"{avg_acc:.2f}%"
-        )
-        
-    return avg_loss, avg_mse, avg_sad, avg_grad, avg_acc
-
-def validate(loader, model, criterion, device, epoch):
-    model.eval()
-    
-    avg_loss = 0
-    avg_mse = 0
-    avg_sad = 0
-    avg_grad = 0
-    avg_acc = 0
-    
-    loop = tqdm(loader, desc="   Valid", leave=True)
-    
-    with torch.no_grad():
-        for batch_idx, (images, masks) in enumerate(loop):
-            images = images.to(device)
-            masks = masks.to(device)
-            
-            # Forward pass without GT Mask (Teacher disabled)
-            pred_alpha, img_feats, _ = model(images, gt_mask=None)
-            loss, _, _, _ = criterion(pred_alpha, masks, img_feats, None)
-            
-            mse, sad, grad, acc = calculate_matting_metrics(pred_alpha, masks)
-            
-            avg_loss = (avg_loss * batch_idx + loss.item()) / (batch_idx + 1)
-            avg_mse = (avg_mse * batch_idx + mse) / (batch_idx + 1)
-            avg_sad = (avg_sad * batch_idx + sad) / (batch_idx + 1)
-            avg_grad = (avg_grad * batch_idx + grad) / (batch_idx + 1)
-            avg_acc = (avg_acc * batch_idx + acc) / (batch_idx + 1)
-            
-            # Update TQDM - Only show Loss and Acc
-            loop.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                acc=f"{avg_acc:.2f}%"
-            )
-            
-    return avg_loss, avg_mse, avg_sad, avg_grad, avg_acc
-
-def main():
-    if not os.path.exists(config.SAVE_DIR):
-        os.makedirs(config.SAVE_DIR)
-        print(f"📁 Created Checkpoint Dir: {config.SAVE_DIR}")
-
-    train_loader, val_loader = get_dataloaders()
-    model, optimizer, criterion, scheduler = build_model_and_optimizer(config.DEVICE)
-    scaler = torch.amp.GradScaler('cuda')
-    logger = CSVLogger(config.SAVE_DIR, filename='training_log.csv')
-    
-    best_sad = float('inf') 
-    
-    history = {
-        'train_loss': [], 'val_loss': [],
-        'train_sad': [], 'val_sad': [],
-        'train_grad': [], 'val_grad': [],
-        'train_mse': [], 'val_mse': [],
-        'train_acc': [], 'val_acc': []
-    }
-
-    print(f"\n🚀 Start Training: {config.EXPERIMENT_NAME}")
-    print(f"   Epochs: {config.NUM_EPOCHS} | Batch: {config.BATCH_SIZE} | Img Size: {config.IMG_SIZE}")
-    print("-" * 60)
+    # --- 5. Training Loop ---
+    best_iou = 0.0
+    history = {'train_loss':[], 'val_loss':[], 'train_sad':[], 'val_sad':[], 
+               'train_grad':[], 'val_grad':[], 'train_mse':[], 'val_mse':[], 'train_acc':[], 'val_acc':[]}
 
     for epoch in range(1, config.NUM_EPOCHS + 1):
+        # ==========================
+        #       Training Phase
+        # ==========================
+        model.train()
+        train_loss_epoch = 0
+        train_metrics = [0, 0, 0, 0] # mse, sad, grad, acc
+
+        train_loop = tqdm(train_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Train]")
         
-        # 1. Train
-        t_loss, t_mse, t_sad, t_grad, t_acc = train_one_epoch(
-            train_loader, model, optimizer, criterion, scaler, config.DEVICE, epoch
-        )
-        
-        # 2. Validate
-        v_loss, v_mse, v_sad, v_grad, v_acc = validate(
-            val_loader, model, criterion, config.DEVICE, epoch
-        )
-        
-        # 3. Scheduler
-        current_lr = optimizer.param_groups[0]['lr']
+        for images, masks in train_loop:
+            images = images.to(config.DEVICE)
+            masks = masks.to(config.DEVICE)
+
+            with torch.amp.autocast('cuda'):
+                # 1. Teacher Forward
+                tea_feats = None
+                if teacher is not None:
+                    with torch.no_grad():
+                        tea_feats = teacher(masks)
+
+                # 2. Student Forward (Supports Deep Supervision)
+                output = model(images)
+                
+                # [🔥 CRITICAL UPDATE: Unpacking Logic]
+                stu_feats = None
+                final_pred = None # Used for metrics calculation
+                preds_for_loss = None # Passed to loss function
+
+                if isinstance(output, tuple):
+                    if len(output) == 3:
+                        # New: (Refined, Coarse, Feats)
+                        refined, coarse, stu_feats = output
+                        # Pack prediction tuple for Deep Supervision in Loss
+                        preds_for_loss = (refined, coarse)
+                        final_pred = refined # Use Refined for metrics
+                    elif len(output) == 2:
+                        # Old: (Preds, Feats) - Legacy support
+                        preds_for_loss, stu_feats = output
+                        final_pred = preds_for_loss
+                else:
+                    # Single output (should not happen in training with TSR-Net)
+                    preds_for_loss = output
+                    final_pred = output
+
+                # 3. Calculate Loss (Deep Supervision handled inside loss_fn)
+                loss, _, _, _ = loss_fn(preds_for_loss, masks, stu_feats, tea_feats)
+
+            # --- Backward ---
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # --- Metrics ---
+            train_loss_epoch += loss.item()
+            with torch.no_grad():
+                # Sigmoid is applied here for metrics
+                pred_final_prob = torch.sigmoid(final_pred)
+                m_vals = calculate_matting_metrics(pred_final_prob, masks)
+                for i in range(4): train_metrics[i] += m_vals[i]
+
+            train_loop.set_postfix(loss=loss.item())
+
         scheduler.step()
-        
-        # Log to CSV (still logs everything)
-        logger.log([
-            epoch, current_lr, 
-            t_loss, t_mse, t_sad, t_grad, t_acc, 
-            v_loss, v_mse, v_sad, v_grad, v_acc
-        ])
-        
-        # 4. Save & Plot
-        history['train_loss'].append(t_loss); history['val_loss'].append(v_loss)
-        history['train_sad'].append(t_sad);   history['val_sad'].append(v_sad)
-        history['train_grad'].append(t_grad); history['val_grad'].append(v_grad)
-        history['train_mse'].append(t_mse);   history['val_mse'].append(v_mse)
-        history['train_acc'].append(t_acc);   history['val_acc'].append(v_acc)
+
+        # Averages
+        train_loss_epoch /= len(train_loader)
+        train_metrics = [x / len(train_loader) for x in train_metrics]
+
+        # ==========================
+        #      Validation Phase
+        # ==========================
+        val_loss_epoch = 0
+        val_metrics = [0, 0, 0, 0]
+        model.eval()
+
+        val_loop = tqdm(val_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Val  ]")
+
+        with torch.no_grad():
+            for images, masks in val_loop:
+                images = images.to(config.DEVICE)
+                masks = masks.to(config.DEVICE)
+
+                # Validation Forward
+                # Note: TSR-Net returns ONLY refined_logits in eval() mode
+                output = model(images)
+                
+                # Handle cases where model might still return tuple in eval (defensive coding)
+                if isinstance(output, tuple):
+                    preds = output[0] 
+                else:
+                    preds = output
+                
+                with torch.amp.autocast('cuda'):
+                    loss, _, _, _ = loss_fn(preds, masks) 
+                
+                val_loss_epoch += loss.item()
+                
+                pred_final_prob = torch.sigmoid(preds)
+                m_vals = calculate_matting_metrics(pred_final_prob, masks)
+                for i in range(4): val_metrics[i] += m_vals[i]
+
+                val_loop.set_postfix(loss=loss.item())
+
+        val_loss_epoch /= len(val_loader)
+        val_metrics = [x / len(val_loader) for x in val_metrics]
+
+        # --- Logging ---
+        log_data = [epoch, optimizer.param_groups[0]['lr'], 
+                    train_loss_epoch, *train_metrics, 
+                    val_loss_epoch, *val_metrics]
+        logger.log(log_data)
+
+        # Update History
+        history['train_loss'].append(train_loss_epoch); history['val_loss'].append(val_loss_epoch)
+        history['train_mse'].append(train_metrics[0]); history['val_mse'].append(val_metrics[0])
+        history['train_sad'].append(train_metrics[1]); history['val_sad'].append(val_metrics[1])
+        history['train_grad'].append(train_metrics[2]); history['val_grad'].append(val_metrics[2])
+        history['train_acc'].append(train_metrics[3]); history['val_acc'].append(val_metrics[3])
+
+        print(f"📉 Epoch {epoch} | Train Loss: {train_loss_epoch:.4f} | Val Loss: {val_loss_epoch:.4f} | Val IoU(Acc): {val_metrics[3]:.2f}%")
+
+        # --- Save Best Model ---
+        current_iou = val_metrics[3]
+        if current_iou > best_iou:
+            best_iou = current_iou
+            torch.save(model.state_dict(), config.BEST_MODEL_PATH)
+            print(f"💾 Best Model Saved! IoU: {best_iou:.2f}%")
         
         torch.save(model.state_dict(), config.LAST_MODEL_PATH)
-        
-        if v_sad < best_sad:
-            best_sad = v_sad
-            print(f"⭐ New Best Model (SAD: {best_sad:.4f}) Saved!")
-            torch.save(model.state_dict(), config.BEST_MODEL_PATH)
-            
-        plot_history(
-            history['train_loss'], history['val_loss'],
-            history['train_sad'], history['val_sad'],
-            history['train_grad'], history['val_grad'],
-            history['train_mse'], history['val_mse'],
-            history['train_acc'], history['val_acc'],
-            config.SAVE_DIR
-        )
 
-    print("\n✅ Training Completed!")
+        if epoch % 5 == 0:
+            plot_history(history['train_loss'], history['val_loss'], 
+                         history['train_sad'], history['val_sad'],
+                         history['train_grad'], history['val_grad'],
+                         history['train_mse'], history['val_mse'],
+                         history['train_acc'], history['val_acc'],
+                         config.LOG_DIR)
 
 if __name__ == "__main__":
-    main()
+    train()

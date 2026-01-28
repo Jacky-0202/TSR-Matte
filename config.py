@@ -3,67 +3,67 @@
 import torch
 import os
 
-# --- 1. Device Setup ---
+# --- 1. Device & System ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_WORKERS = 4         # Number of data loading threads
+PIN_MEMORY = True       # Accelerate data transfer to GPU
 
 # --- 2. Model Selection ---
-# List of available Swin Transformer backbones.
-SWIN_VARIANTS = [
-    'swin_tiny_patch4_window7_224',    # [0] Tiny
-    'swin_small_patch4_window7_224',   # [1] Small
-    'swin_base_patch4_window7_224',    # [2] Base (Recommended for TSR-Matte)
-    'swin_base_patch4_window12_384',   # [3] Base 384 (Heavy VRAM)
-    'swin_large_patch4_window12_384'   # [4] Large (Overkill)
-]
+BACKBONE_OPTIONS = {
+    'tiny':  'swin_tiny_patch4_window7_224',    # [96 dim]
+    'small': 'swin_small_patch4_window7_224',   # [96 dim]
+    'base':  'swin_base_patch4_window7_224',    # [128 dim]
+    'base384': 'swin_base_patch4_window12_384', # [128 dim]
+    'large': 'swin_large_patch4_window12_384'   # [192 dim]
+}
 
-# 👉 Set to 2 (Swin Base) for high performance
-MODEL_IDX = 2
+MODEL_SELECT = 'base' 
 
-try:
-    BACKBONE = SWIN_VARIANTS[MODEL_IDX]
-except IndexError:
-    print(f"⚠️ Invalid MODEL_IDX: {MODEL_IDX}, defaulting to [0] Tiny")
-    BACKBONE = SWIN_VARIANTS[0]
+if MODEL_SELECT not in BACKBONE_OPTIONS:
+    raise ValueError(f"Invalid model selection: {MODEL_SELECT}")
+
+BACKBONE_NAME = BACKBONE_OPTIONS[MODEL_SELECT]
+print(f"🔹 Selected Backbone: {MODEL_SELECT.upper()} ({BACKBONE_NAME})")
 
 # --- 3. Hyperparameters ---
-IMG_SIZE = 1024        # SOTA Standard for DIS5K
-BATCH_SIZE = 2         # Set to 2 for Swin Base + 1024 size (Increase if VRAM > 24GB)
-NUM_CLASSES = 1        
-NUM_EPOCHS = 150       
-NUM_WORKERS = 4        
-PIN_MEMORY = True      
+IMG_SIZE = 1024         # 1024x1024 input
+BATCH_SIZE = 2         # Adjust based on VRAM (8-16 for Base)
+NUM_EPOCHS = 150        # Matting needs more epochs to refine details
+LEARNING_RATE = 1e-4    
+WEIGHT_DECAY = 1e-4     
 
-LEARNING_RATE = 2e-4   
-SCHEDULER_T0 = 10
-SCHEDULER_T_MULT = 2
-SCHEDULER_ETA_MIN = 1e-6
+# --- 4. Strategy Settings ---
+# [Twin-Swin Strategy]
+USE_TWIN_ALIGNMENT = True  
+DILATE_MASK = False        # [CRITICAL CHANGE] Set to False for fine matting!
 
-# --- 4. Paths ---
+# --- 5. Loss Weights (Updated for Ultimate Matting Loss) ---
+# These keys must match the __init__ arguments in utils/loss.py
+LOSS_WEIGHTS = {
+    'weight_struct': 1.0,  # [New] BiRefNet Structure Loss (Core)
+    'weight_l1': 1.0,      # [New] L1 Loss for pixel precision
+    'weight_grad': 1.0,    # [New] Gradient Loss for sharp edges
+    'weight_ssim': 0.5,    # Structure consistency
+    'weight_feat': 0.2     # Feature Alignment
+}
+
+# --- 6. Paths ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# DATASET_ROOT = "Datasets/DIS5K_Flat" 
+DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/DIS5K_Flat" 
 
-# Dataset Root Directory (Adjust if needed)
-DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/DIS5K_Flat"
+TRAIN_ROOT = os.path.join(DATASET_ROOT, 'train') 
+VAL_ROOT = os.path.join(DATASET_ROOT, 'val')     
 
-# --- 5. Checkpoints & Logging ---
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
+# --- 7. Logging & Saving ---
+# Updated experiment name to reflect "Matte" instead of "Loc"
+EXPERIMENT_NAME = f"TwinSwin_{MODEL_SELECT.capitalize()}_Matte1024"
 
-# Extract tag (e.g., "Base", "Tiny")
-model_tag = 'Unknown'
-if 'tiny' in BACKBONE: model_tag = 'Tiny'
-elif 'small' in BACKBONE: model_tag = 'Small'
-elif 'base' in BACKBONE: model_tag = 'Base'
-elif 'large' in BACKBONE: model_tag = 'Large'
+CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints', EXPERIMENT_NAME)
+LOG_DIR = os.path.join(PROJECT_ROOT, 'logs', EXPERIMENT_NAME)
 
-if '384' in BACKBONE:
-    model_tag += '_384'
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# [UPDATED] Official Experiment Name: TSR-Matte
-# Format: TSR-Matte_SwinBase_1024
-EXPERIMENT_NAME = f"TSR-Matte_Swin{model_tag}_{IMG_SIZE}"
-
-SAVE_DIR = os.path.join(CHECKPOINT_DIR, EXPERIMENT_NAME)
-BEST_MODEL_PATH = os.path.join(SAVE_DIR, 'best_model.pth')
-LAST_MODEL_PATH = os.path.join(SAVE_DIR, 'last_model.pth')
-
-# Ensure the save directory exists
-os.makedirs(SAVE_DIR, exist_ok=True)
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
+LAST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'last_model.pth')

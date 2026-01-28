@@ -1,11 +1,82 @@
-# utils/loss.py
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
+# ==========================================
+# 1. Structure Loss (Derived from BiRefNet / F3Net)
+#    Core Function: Edge-weighted perception.
+#    It assigns higher weights to boundary areas to fix inaccurate edges.
+# ==========================================
+class StructureLoss(nn.Module):
+    def __init__(self):
+        super(StructureLoss, self).__init__()
+
+    def forward(self, pred, mask):
+        """
+        Args:
+            pred: Model Logits (B, 1, H, W) -> Before Sigmoid
+            mask: Ground Truth (B, 1, H, W) -> 0 or 1
+        """
+        # 1. Generate Edge-Weighted Map (weit)
+        # Apply AvgPool to GT to blur it, then subtract from original GT.
+        # The absolute difference is maximized at the edges.
+        wb = 1.0
+        target = mask.float()
+        
+        # Uses a 31x31 Kernel to detect edges
+        weit = 1 + 5 * torch.abs(F.avg_pool2d(target, kernel_size=31, stride=1, padding=15) - target)
+        
+        # 2. Weighted BCE Loss (Focuses heavily on edges)
+        wbce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
+
+        # 3. Weighted IoU Loss (Structure-aware)
+        pred_prob = torch.sigmoid(pred)
+        inter = ((pred_prob * target) * weit).sum(dim=(2, 3))
+        union = ((pred_prob + target) * weit).sum(dim=(2, 3))
+        wiou = 1 - (inter + 1) / (union - inter + 1)
+
+        # Return the average of both Weighted BCE and Weighted IoU
+        return (wbce + wiou).mean()
+
+# ==========================================
+# 2. Gradient Loss (Essential for Matting)
+#    Core Function: Enforces gradient consistency.
+#    Ensures that the predicted edges are as sharp as the GT.
+# ==========================================
+class GradientLoss(nn.Module):
+    def __init__(self):
+        super(GradientLoss, self).__init__()
+        # Sobel Kernels for X and Y directions
+        kernel_x = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+        kernel_y = torch.Tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+        self.kernel_x = kernel_x.view((1, 1, 3, 3))
+        self.kernel_y = kernel_y.view((1, 1, 3, 3))
+
+    def forward(self, pred, gt):
+        # pred, gt: (B, 1, H, W) Probability maps [0, 1]
+        
+        # Ensure kernels are on the same device as input
+        if pred.device != self.kernel_x.device:
+            self.kernel_x = self.kernel_x.to(pred.device)
+            self.kernel_y = self.kernel_y.to(pred.device)
+
+        # Compute gradients
+        pred_grad_x = F.conv2d(pred, self.kernel_x, padding=1)
+        pred_grad_y = F.conv2d(pred, self.kernel_y, padding=1)
+        gt_grad_x = F.conv2d(gt, self.kernel_x, padding=1)
+        gt_grad_y = F.conv2d(gt, self.kernel_y, padding=1)
+
+        # Calculate L1 distance between gradients (Enforces sharpness)
+        grad_loss = torch.abs(pred_grad_x - gt_grad_x) + torch.abs(pred_grad_y - gt_grad_y)
+        return grad_loss.mean()
+
+# ==========================================
+# 3. SSIM Loss (Auxiliary Structural Integrity)
+#    Core Function: Maintains local structural similarity (luminance/contrast/structure).
+# ==========================================
 class SSIMLoss(nn.Module):
     def __init__(self, window_size=11, size_average=True):
         super(SSIMLoss, self).__init__()
@@ -48,124 +119,116 @@ class SSIMLoss(nn.Module):
 
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
-
+        
+        # Check if window needs to be re-initialized (e.g., if device changed)
         if channel == self.channel and self.window.data.type() == img1.data.type():
             window = self.window
         else:
             window = self.create_window(self.window_size, channel)
-            
             if img1.is_cuda:
                 window = window.cuda(img1.get_device())
             window = window.type_as(img1)
-            
             self.window = window
             self.channel = channel
-
+            
         return 1.0 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
-
-class IoULoss(nn.Module):
-    def __init__(self, smooth=1e-6):
-        super(IoULoss, self).__init__()
-        self.smooth = smooth
-
-    def forward(self, pred, gt):
-        # Soft IoU calculation
-        intersection = (pred * gt).sum(dim=(2, 3))
-        total = (pred + gt).sum(dim=(2, 3))
-        union = total - intersection
-        
-        iou = (intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - iou.mean()
-
-# --- [NEW] Gradient Loss ---
-class GradientLoss(nn.Module):
-    def __init__(self):
-        super(GradientLoss, self).__init__()
-        # Sobel filters
-        kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        
-        self.register_buffer('kernel_x', kernel_x)
-        self.register_buffer('kernel_y', kernel_y)
-
-    def forward(self, pred, gt):
-        # Calculate gradients
-        pred_grad_x = F.conv2d(pred, self.kernel_x, padding=1)
-        pred_grad_y = F.conv2d(pred, self.kernel_y, padding=1)
-        gt_grad_x = F.conv2d(gt, self.kernel_x, padding=1)
-        gt_grad_y = F.conv2d(gt, self.kernel_y, padding=1)
-        
-        # Gradient magnitude
-        pred_grad = torch.sqrt(pred_grad_x**2 + pred_grad_y**2 + 1e-8)
-        gt_grad = torch.sqrt(gt_grad_x**2 + gt_grad_y**2 + 1e-8)
-        
-        # L1 loss on gradients
-        return F.l1_loss(pred_grad, gt_grad)
-
+# ==========================================
+# 4. Main Loss Wrapper (Deep Supervision Ready)
+#    Combines BiRefNet's Structure Loss with Matting Losses.
+#    Supports Tuple inputs for both Refined and Coarse predictions.
+# ==========================================
 class MattingLoss(nn.Module):
-    def __init__(self, weight_bce=1.0, weight_l1=1.0, weight_ssim=0.5, weight_iou=0.5, weight_grad=1.0, weight_feat=0.0):
+    def __init__(self, 
+                 weight_struct=1.0, # [BiRefNet] Structure & Edge weighting (Includes weighted BCE + IoU)
+                 weight_l1=1.0,     # [Matting] Pixel-level absolute error (Core for regression)
+                 weight_grad=1.0,   # [Matting] Gradient sharpness
+                 weight_ssim=0.5,   # [Common] Structural integrity
+                 weight_feat=0.2):  # [Twin] Feature alignment (if Teacher is used)
         super(MattingLoss, self).__init__()
         
-        self.weight_bce = weight_bce
+        self.weight_struct = weight_struct
         self.weight_l1 = weight_l1
+        self.weight_grad = weight_grad
         self.weight_ssim = weight_ssim
-        self.weight_iou = weight_iou
-        self.weight_grad = weight_grad # [NEW] Gradient Loss Weight
         self.weight_feat = weight_feat
         
-        self.bce = nn.BCELoss()
+        # Initialize Loss Modules
+        self.structure_loss = StructureLoss()
         self.l1 = nn.L1Loss()
+        self.grad = GradientLoss()
+        self.ssim = SSIMLoss()
         self.mse = nn.MSELoss()
-        self.iou = IoULoss()
-        self.ssim = SSIMLoss(window_size=11)
-        self.grad_loss = GradientLoss() # [NEW] Initialize Gradient Loss
-        
 
-    def forward(self, pred_alpha, gt_alpha, stu_feats=None, tea_feats=None):
+    def calculate_single_loss(self, pred_logits, gt_f32):
+        """ 
+        Helper function to calculate the weighted sum of losses for a single prediction map.
         """
-        Calculate composite matting loss.
-        """
-        epsilon = 1e-6
+        # 1. Structure Loss (Uses Raw Logits)
+        loss_struct = 0.0
+        if self.weight_struct > 0:
+            loss_struct = self.structure_loss(pred_logits, gt_f32)
+
+        # 2. Generate Probability Map (Sigmoid)
+        pred_prob = torch.sigmoid(pred_logits)
         
-        pred_f32 = pred_alpha.float()
+        # 3. Calculate Pixel-level Losses
+        loss_l1 = self.l1(pred_prob, gt_f32) if self.weight_l1 > 0 else 0.0
+        loss_grad = self.grad(pred_prob, gt_f32) if self.weight_grad > 0 else 0.0
+        loss_ssim = self.ssim(pred_prob, gt_f32) if self.weight_ssim > 0 else 0.0
+        
+        # 4. Summation
+        total = (self.weight_struct * loss_struct) + \
+                (self.weight_l1 * loss_l1) + \
+                (self.weight_grad * loss_grad) + \
+                (self.weight_ssim * loss_ssim)
+                
+        return total, loss_l1
+
+    def forward(self, preds, gt_alpha, stu_feats=None, tea_feats=None):
+        """
+        Args:
+            preds: Can be a single Tensor OR a Tuple (refined_logits, coarse_logits)
+            gt_alpha: Ground Truth (B, 1, H, W)
+            stu_feats: Student Features
+            tea_feats: Teacher Features
+        """
         gt_f32 = gt_alpha.float()
+        
+        # --- 1. Content Loss (Deep Supervision) ---
+        total_content_loss = 0.0
+        main_l1 = 0.0 # Used for logging the L1 of the final output
+        
+        if isinstance(preds, (tuple, list)):
+            # [Refiner Mode]
+            # preds[0] = Refined (Final) -> Weight 1.0 (Primary Focus)
+            # preds[1] = Coarse (Backbone) -> Weight 0.5 (Auxiliary Supervision)
+            
+            # A. Refined Loss (Priority: High)
+            loss_refined, l1_refined = self.calculate_single_loss(preds[0], gt_f32)
+            total_content_loss += loss_refined
+            main_l1 = l1_refined
+            
+            # B. Coarse Loss (Priority: Medium - prevents backbone degradation)
+            if len(preds) > 1:
+                loss_coarse, _ = self.calculate_single_loss(preds[1], gt_f32)
+                total_content_loss += 0.5 * loss_coarse
+                
+        else:
+            # [Standard Mode] Single output
+            total_content_loss, main_l1 = self.calculate_single_loss(preds, gt_f32)
 
-        pred_clamped = torch.clamp(pred_f32, epsilon, 1.0 - epsilon)
-        gt_clamped = torch.clamp(gt_f32, 0.0, 1.0)
-        
-        # --- 1. BCE Loss ---
-        with torch.autocast(device_type='cuda', enabled=False):
-            loss_bce = self.bce(pred_clamped, gt_clamped)
-        
-        # --- 2. L1 Loss ---
-        loss_l1 = self.l1(pred_clamped, gt_clamped)
-        
-        # --- 3. SSIM Loss ---
-        loss_ssim = self.ssim(pred_clamped, gt_clamped)
-        
-        # --- 4. IoU Loss ---
-        loss_iou = self.iou(pred_clamped, gt_clamped)
-
-        # --- [NEW] 5. Gradient Loss ---
-        loss_grad = self.grad_loss(pred_clamped, gt_clamped)
-        
-        # --- 6. Feature Consistency Loss ---
-        loss_feat = 0.0
+        # --- 2. Feature Alignment Loss (Twin Strategy) ---
+        loss_feat = torch.tensor(0.0, device=gt_alpha.device)
         if self.weight_feat > 0 and stu_feats is not None and tea_feats is not None:
-            with torch.autocast(device_type='cuda', enabled=False):
+            if isinstance(stu_feats, (list, tuple)):
                 for s_f, t_f in zip(stu_feats, tea_feats):
                     loss_feat += self.mse(s_f.float(), t_f.float())
+            else:
+                loss_feat += self.mse(stu_feats.float(), tea_feats.float())
         
-        # --- Total Loss ---
-        total_loss = (self.weight_bce * loss_bce) + \
-                     (self.weight_l1 * loss_l1) + \
-                     (self.weight_ssim * loss_ssim) + \
-                     (self.weight_iou * loss_iou) + \
-                     (self.weight_grad * loss_grad) + \
-                     (self.weight_feat * loss_feat)
+        # --- 3. Final Summation ---
+        total_loss = total_content_loss + (self.weight_feat * loss_feat)
         
-        # Loss detail for monitoring
-        loss_detail = loss_ssim + loss_iou + loss_grad
-        
-        return total_loss, loss_l1, loss_detail, loss_feat
+        # Return components for logging (Loss, L1, Content, Feature)
+        return total_loss, main_l1, total_content_loss, loss_feat

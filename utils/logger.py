@@ -7,6 +7,8 @@ import torch
 class CSVLogger:
     def __init__(self, save_dir, filename='training_log.csv'):
         """
+        Initialize the CSV Logger.
+        
         Args:
             save_dir (str): Directory where the log file will be saved.
             filename (str): Name of the CSV file.
@@ -14,8 +16,8 @@ class CSVLogger:
         self.save_dir = save_dir
         self.filepath = os.path.join(save_dir, filename)
         
-        # [UPDATED] Expanded headers to include SAD and Grad
-        # Matting metrics: MSE, SAD, Grad, Acc
+        # Define CSV headers
+        # Metrics: Loss, MSE, SAD, Grad, Accuracy
         self.headers = [
             'Epoch', 'LR', 
             'Train_Loss', 'Train_MSE', 'Train_SAD', 'Train_Grad', 'Train_Acc', 
@@ -35,25 +37,28 @@ class CSVLogger:
     def log(self, data):
         """
         Write a single row of data to the CSV.
+        Data should match the order of self.headers.
         """
         clean_data = []
         
         for x in data:
-            # 1. Handle PyTorch Tensors
+            # 1. Handle PyTorch Tensors (detach to CPU)
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu().item()
             
-            # 2. Handle Floats
-            if isinstance(x, float):
-                # Use scientific notation for very small numbers
-                if 0 < abs(x) < 0.0001:
+            # 2. Handle Floats (Unified formatting)
+            if isinstance(x, (float, int)):
+                # Use scientific notation for very small numbers, else 6 decimal places
+                if isinstance(x, float) and 0 < abs(x) < 1e-4:
                     clean_data.append(f"{x:.4e}")
-                else:
-                    # [UPDATED] increased precision slightly to .6f
+                elif isinstance(x, float):
                     clean_data.append(f"{x:.6f}")
+                else:
+                    clean_data.append(x)
             else:
                 clean_data.append(x)
 
+        # Use 'a' (append) mode to ensure data is saved even if training crashes
         with open(self.filepath, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(clean_data)

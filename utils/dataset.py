@@ -6,136 +6,144 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 from torchvision import transforms
-import torchvision.transforms.functional as TF
-from PIL import Image
 
-Image.MAX_IMAGE_PIXELS = None
-
-class MattingDataset(Dataset):
-    def __init__(self, root_dir, mode='train', img_size=512):
+class DIS5KDataset(Dataset):
+    def __init__(self, root_dir, mode='train', target_size=1024, dilate_mask=True):
         """
-        Dataset for TwinSwin-Matte (DIS5K Structure).
+        DIS5K Dataset with Letterbox Resize (Keep Aspect Ratio).
+        
+        Args:
+            root_dir (str): Path to 'Datasets/DIS5K_Flat/'
+            mode (str): 'train' or 'val'
+            target_size (int): The long-side resolution (e.g., 1024).
+            dilate_mask (bool): Whether to apply slight dilation to GT (crucial for thin structures).
         """
         self.root_dir = root_dir
         self.mode = mode
-        self.img_size = img_size
+        self.target_size = target_size
+        self.dilate_mask = dilate_mask
         
-        # 1. Construct Paths
+        # 1. Setup Paths
+        # Structure: root/train/im/*.jpg, root/train/gt/*.png
         self.img_folder = os.path.join(root_dir, mode, 'im')
         self.mask_folder = os.path.join(root_dir, mode, 'gt')
         
-        # 2. Get File List
-        if not os.path.exists(self.img_folder):
-            raise FileNotFoundError(f"Image folder not found: {self.img_folder}")
+        # 2. Check Paths
+        if not os.path.exists(self.img_folder) or not os.path.exists(self.mask_folder):
+            raise FileNotFoundError(f"Folder not found. Check: {self.img_folder}")
             
+        # 3. Load File List
         valid_ext = ('.jpg', '.jpeg', '.png')
         self.image_files = sorted([f for f in os.listdir(self.img_folder) if f.lower().endswith(valid_ext)])
         
-        print(f"[{mode.upper()}] Loaded {len(self.image_files)} images from {self.img_folder}")
+        print(f"[{mode.upper()}] Found {len(self.image_files)} images in {self.img_folder}")
 
-        # 3. Base Transforms (ImageNet Norm)
-        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # 4. Normalization (ImageNet stats)
+        # Using standard mean/std for pre-trained backbones
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def __len__(self):
         return len(self.image_files)
+
+    def _letterbox(self, img, mask, target_size):
+        """
+        Resize image and mask while keeping aspect ratio. 
+        Pad the shorter side with zeros (black).
+        """
+        h, w = img.shape[:2]
+        scale = target_size / max(h, w)
         
-    def _round_to_32(self, x):
-        """Helper to ensure dimensions are multiples of 32"""
-        return int(round(x / 32) * 32)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize
+        # Image: Cubic/Linear for better quality
+        # Mask: Linear/Area to preserve soft edges (if using soft labels) or Nearest
+        img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST) # Or LINEAR if you want soft edges
+        
+        # Create canvas
+        canvas_img = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        canvas_mask = np.zeros((target_size, target_size), dtype=np.uint8)
+        
+        # Paste in center
+        start_x = (target_size - new_w) // 2
+        start_y = (target_size - new_h) // 2
+        
+        canvas_img[start_y:start_y+new_h, start_x:start_x+new_w] = img_resized
+        canvas_mask[start_y:start_y+new_h, start_x:start_x+new_w] = mask_resized
+        
+        return canvas_img, canvas_mask
 
     def __getitem__(self, index):
-        # --- A. Load Image & Mask ---
+        # --- A. Load Data ---
         img_name = self.image_files[index]
         img_path = os.path.join(self.img_folder, img_name)
         
+        # Find corresponding mask
         file_stem = os.path.splitext(img_name)[0]
-        mask_name = file_stem + '.png'
+        mask_name = file_stem + '.png' # Masks are usually png
         mask_path = os.path.join(self.mask_folder, mask_name)
         
+        # Fallback if mask has different extension
         if not os.path.exists(mask_path):
              mask_path = os.path.join(self.mask_folder, file_stem + '.jpg')
 
-        try:
-            image = Image.open(img_path).convert('RGB')
-            mask = Image.open(mask_path).convert('L')
-        except Exception as e:
-            print(f"⚠️ Error loading {img_name}: {e}")
-            # Return a dummy tensor or skip (handling skip inside __getitem__ is tricky, usually better to return a safe fallback)
-            # Here we just re-raise to see the error, or you can implement a safe fallback.
-            raise e
+        # Read Image (BGR -> RGB)
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"⚠️ Error reading image: {img_path}")
+            return self.__getitem__((index + 1) % len(self)) # Skip broken
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Read Mask (Grayscale)
+        mask = cv2.imread(mask_path, 0)
+        if mask is None:
+            print(f"⚠️ Error reading mask: {mask_path}")
+            return self.__getitem__((index + 1) % len(self))
 
-        # --- B. Augmentation & Transform ---
+        # --- B. Pre-processing (Dilation) ---
+        # Keep detail
+        if self.dilate_mask and self.mode == 'train':
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        # --- C. Augmentation (Train Only) ---
         if self.mode == 'train':
-            # 1. Random Resize
-            scale = np.random.uniform(0.5, 1.5)
-            new_w = int(image.width * scale)
-            new_h = int(image.height * scale)
+            # 1. Random Horizontal Flip
+            if np.random.rand() > 0.5:
+                image = cv2.flip(image, 1)
+                mask = cv2.flip(mask, 1)
             
-            # Resize
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            mask = TF.resize(mask, (new_h, new_w), interpolation=Image.BILINEAR)
+            # 2. Color Jitter (Simulated with simple numpy ops)
+            if np.random.rand() > 0.2:
+                # Brightness
+                value = np.random.uniform(0.8, 1.2)
+                image = np.clip(image * value, 0, 255).astype(np.uint8)
 
-            # 2. Padding
-            if new_w < self.img_size or new_h < self.img_size:
-                pad_w = max(0, self.img_size - new_w)
-                pad_h = max(0, self.img_size - new_h)
-                image = TF.pad(image, (0, 0, pad_w, pad_h), fill=0)
-                mask = TF.pad(mask, (0, 0, pad_w, pad_h), fill=0)
-            
-            # 3. Random Rotation
-            if np.random.random() > 0.5:
-                angle = np.random.uniform(-30, 30)
-                image = TF.rotate(image, angle, interpolation=Image.BILINEAR)
-                mask = TF.rotate(mask, angle, interpolation=Image.BILINEAR)
+        # --- D. Letterbox Resize (The Core Logic) ---
+        image, mask = self._letterbox(image, mask, self.target_size)
 
-            # 4. Random Crop
-            i, j, h, w = transforms.RandomCrop.get_params(image, output_size=(self.img_size, self.img_size))
-            image = TF.crop(image, i, j, h, w)
-            mask = TF.crop(mask, i, j, h, w)
-            
-            # 5. Random Horizontal Flip
-            if np.random.random() > 0.5:
-                image = TF.hflip(image)
-                mask = TF.hflip(mask)
-
-            # 6. Gaussian Blur
-            if np.random.random() > 0.5:
-                sigma = np.random.uniform(0.1, 2.0)
-                image = TF.gaussian_blur(image, kernel_size=5, sigma=sigma)
-
-            # 7. Random Grayscale
-            if np.random.random() > 0.8:
-                image = TF.to_grayscale(image, num_output_channels=3)
-
-            # 8. Color Jitter
-            if np.random.random() > 0.2:
-                color_tf = transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
-                image = color_tf(image)
-
-        else:
-            # === Validation Logic ===
-            w, h = image.size
-            
-            # Resize logic: Ensure strictly multiples of 32
-            # 1. Resize based on short side match
-            scale_ratio = self.img_size / min(w, h)
-            new_w = w * scale_ratio
-            new_h = h * scale_ratio
-            
-            # 2. Round dimensions to nearest multiple of 32
-            final_w = self._round_to_32(new_w)
-            final_h = self._round_to_32(new_h)
-            
-            # Ensure at least 32x32
-            final_w = max(32, final_w)
-            final_h = max(32, final_h)
-            
-            image = TF.resize(image, (final_h, final_w), interpolation=Image.BILINEAR)
-            mask = TF.resize(mask, (final_h, final_w), interpolation=Image.BILINEAR)
-
-        # --- C. ToTensor & Normalize ---
-        image = TF.to_tensor(image)
-        image = self.normalize(image)
-        mask = TF.to_tensor(mask)
+        # --- E. To Tensor & Normalize ---
+        # Image: (H, W, 3) -> (3, H, W), Float32, 0-1, Normalize
+        image = image.astype(np.float32) / 255.0
+        image = (image - self.mean) / self.std
+        image = image.transpose(2, 0, 1) # HWC -> CHW
+        image = torch.from_numpy(image).float()
+        
+        # Mask: (H, W) -> (1, H, W), Float32, 0-1
+        mask = mask.astype(np.float32) / 255.0
+        mask = np.expand_dims(mask, axis=0) # Add channel dim
+        mask = torch.from_numpy(mask).float()
         
         return image, mask
+
+# simple test
+# if __name__ == "__main__":
+#     root = "datasets_matte/DIS5K_Flat/"
+#     if os.path.exists(root):
+#         ds = DIS5KDataset(root, mode='train', target_size=1024)
+#         img, mask = ds[0]
+#         print(f"Image Shape: {img.shape}") # Should be (3, 1024, 1024)
+#         print(f"Mask Shape: {mask.shape}") # Should be (1, 1024, 1024)

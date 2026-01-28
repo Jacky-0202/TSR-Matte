@@ -1,3 +1,5 @@
+torch
+torchvision
 timm
 tqdm
 h5py
