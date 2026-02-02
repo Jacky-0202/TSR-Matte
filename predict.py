@@ -1,192 +1,109 @@
-# predict.py
-
 import os
-import sys
-import torch
 import cv2
 import numpy as np
-from PIL import Image
-from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+import torch
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
-import torch.nn.functional as F
 
-# --- Project Setup ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
+# --- Import Project Modules ---
+from config import Config
+from models.twinswinunet import TwinSwinUNet
 
-import config as config
-# [FIX] Import the correct model class
-from models.twin_swin_unet import TwinSwinUNet
-
-# --- 1. Settings ---
-INPUT_DIR = 'test_data'         # Directory for input test images
-OUTPUT_DIR = 'test_results'     # Directory for output results
-
-# Batch Size for Inference
-BATCH_SIZE = 8                  
-
-# Model Path (Points to 'checkpoints/.../best_model.pth')
-MODEL_PATH = config.BEST_MODEL_PATH
-
-# Inference Size (Height, Width)
-IMG_SIZE = config.IMG_SIZE 
-
-# --- 2. Inference Dataset ---
-class InferenceDataset(Dataset):
-    def __init__(self, root_dir, img_size, transform):
-        self.root_dir = root_dir
-        self.img_size = img_size
-        self.transform = transform
-        
-        valid_ext = ('.jpg', '.jpeg', '.png', '.bmp')
-        if os.path.exists(root_dir):
-            self.files = sorted([f for f in os.listdir(root_dir) if f.lower().endswith(valid_ext)])
-        else:
-            self.files = []
-        
-        if len(self.files) == 0:
-            print(f"⚠️ No images found in {root_dir}")
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        img_name = self.files[idx]
-        img_path = os.path.join(self.root_dir, img_name)
-        
-        # Load Image
-        image = Image.open(img_path).convert('RGB')
-        orig_w, orig_h = image.size
-        
-        # Resize to fixed size for batching
-        img_resized = image.resize((self.img_size, self.img_size), Image.BILINEAR)
-        
-        # Apply Transforms (ToTensor + Normalize)
-        img_tensor = self.transform(img_resized)
-        
-        # Return tensor, filename, and original dimensions
-        return img_tensor, img_name, orig_w, orig_h
-
-# --- 3. Visualization Helper ---
-def save_result(alpha_tensor, img_name, orig_w, orig_h, save_dir):
-    """
-    Saves the alpha matte restored to original size.
-    """
-    # alpha_tensor: (1, H, W) on GPU, values are probabilities [0, 1]
-    
-    # 1. Upsample back to Original Size
-    # Input must be 4D (N, C, H, W) for interpolate
-    alpha_resized = F.interpolate(
-        alpha_tensor.unsqueeze(0), 
-        size=(orig_h, orig_w), 
-        mode='bilinear', 
-        align_corners=True
-    )
-    
-    # 2. Convert to Numpy
-    alpha_np = alpha_resized.squeeze().cpu().numpy() # (H, W)
-    alpha_np = np.clip(alpha_np, 0, 1)
-    
-    # 3. Save Alpha (Grayscale)
-    save_base_name = os.path.splitext(img_name)[0]
-    alpha_uint8 = (alpha_np * 255).astype(np.uint8)
-    
-    # Ensure output directory exists
-    os.makedirs(save_dir, exist_ok=True)
-    
-    cv2.imwrite(os.path.join(save_dir, save_base_name + "_alpha.png"), alpha_uint8)
+# ==========================================
+# 🔧 USER CONFIGURATION
+# ==========================================
+CHECKPOINT_PATH = "./checkpoints/TwinSwin_DIS5K_LOCATOR_1024_202601301620/best_model.pth"
+INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/DIS5K/DIS-TE1/im" 
+OUTPUT_DIR = "./results"
+# ==========================================
 
 def main():
-    # Setup
+    # 1. Setup Environment
+    device = torch.device(Config.DEVICE)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    if not os.path.exists(INPUT_DIR):
-        print(f"❌ Input directory '{INPUT_DIR}' not found. Please create it and add images.")
-        return
-
-    device = config.DEVICE
-    print(f"🚀 Loading Model from: {MODEL_PATH}")
-    print(f"   Backbone: {config.BACKBONE_NAME}")
-    print(f"   Inference Size: {IMG_SIZE}x{IMG_SIZE}")
-
-    # Initialize Model (TwinSwinUNet)
-    model = TwinSwinUNet(
-        n_classes=1, 
-        img_size=config.IMG_SIZE, 
-        backbone_name=config.BACKBONE_NAME, 
-        pretrained=False # Inference mode, no need to download weights
-    ).to(device)
     
-    # Load Weights
-    if os.path.exists(MODEL_PATH):
-        try:
-            # Load checkpoint
-            checkpoint = torch.load(MODEL_PATH, map_location=device)
-            
-            # Compatible with saving entire model or just state_dict
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-                
-            model.eval()
-            print("✅ Model weights loaded successfully.")
-        except Exception as e:
-            print(f"❌ Error loading weights: {e}")
-            return
-    else:
-        print(f"❌ Weight file not found at: {MODEL_PATH}")
-        return
+    print(f"🚀 Loading Model: {Config.MODEL_TYPE} ({Config.BACKBONE_NAME})")
+    print(f"   Inference Resolution: {Config.IMG_SIZE}x{Config.IMG_SIZE}")
+    print(f"   Checkpoint: {CHECKPOINT_PATH}")
+    print(f"   Input:      {INPUT_PATH}")
+    print(f"   Output:     {OUTPUT_DIR}")
 
-    # Transforms (Must match training)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # 2. Load Model
+    model = TwinSwinUNet().to(device)
+    
+    if not os.path.exists(CHECKPOINT_PATH):
+        raise FileNotFoundError(f"❌ Checkpoint not found at: {CHECKPOINT_PATH}")
+
+    # Load Weights (Handle 'state_dict' wrapper if present)
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    if 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    model.eval() # Set to evaluation mode (Freeze BN, Dropout)
+
+    # 3. Define Preprocessing (Must match Training!)
+    # We resize input to Target Size (1024), model handles Safe Size (896) internally.
+    transform = A.Compose([
+        A.Resize(height=Config.IMG_SIZE, width=Config.IMG_SIZE),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
     ])
 
-    # --- Prepare DataLoader ---
-    test_dataset = InferenceDataset(INPUT_DIR, IMG_SIZE, transform)
-    
-    if len(test_dataset) == 0:
+    # 4. Prepare File List
+    if os.path.isdir(INPUT_PATH):
+        image_paths = [os.path.join(INPUT_PATH, f) for f in os.listdir(INPUT_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    else:
+        image_paths = [INPUT_PATH]
+
+    if not image_paths:
+        print(f"❌ No images found in {INPUT_PATH}")
         return
 
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=4,
-        pin_memory=True
-    )
+    print(f"📂 Found {len(image_paths)} images. Starting Inference...")
 
-    print(f"📂 Found {len(test_dataset)} images. Processing...")
-    
-    # --- Inference Loop ---
-    with torch.no_grad():
-        for batch_imgs, batch_names, batch_ws, batch_hs in tqdm(test_loader):
-            batch_imgs = batch_imgs.to(device)
-            
-            # Forward Pass
-            # The model returns Logits.
-            preds = model(batch_imgs)
-            
-            # Handle tuple output (just in case model returns extra info)
-            if isinstance(preds, tuple):
-                preds = preds[0]
-            
-            # Apply Sigmoid to get probabilities [0, 1]
-            preds = torch.sigmoid(preds)
-            
-            # Process each image in the batch
-            for i in range(len(batch_imgs)):
-                img_name = batch_names[i]
-                orig_w = batch_ws[i].item()
-                orig_h = batch_hs[i].item()
-                alpha_pred = preds[i] # (1, H, W)
-                
-                # Restore size and Save
-                save_result(alpha_pred, img_name, orig_w, orig_h, OUTPUT_DIR)
+    # 5. Inference Loop
+    for img_path in tqdm(image_paths):
+        # Read Image
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"❌ Error reading: {img_path}")
+            continue
+        
+        # Convert BGR (OpenCV) to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        original_h, original_w = image.shape[:2]
 
-    print(f"\n✅ All Done! Results saved to '{OUTPUT_DIR}'")
+        # Preprocess
+        aug = transform(image=image)
+        img_tensor = aug['image'].unsqueeze(0).to(device) # (3, H, W) -> (1, 3, H, W)
 
-if __name__ == "__main__":
+        # Predict
+        with torch.no_grad():
+            # Model returns Sigmoid result (0~1) directly in eval mode
+            pred_tensor = model(img_tensor) 
+            
+            # Post-process
+            # (1, 1, H, W) -> (H, W) -> CPU -> Numpy
+            pred_mask = pred_tensor.squeeze().cpu().numpy()
+
+        # Resize back to original image size (Optional but recommended)
+        # Using INTER_LINEAR for smoothness
+        pred_mask = cv2.resize(pred_mask, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+
+        # Convert to 0-255 image
+        pred_mask = (pred_mask * 255).astype(np.uint8)
+
+        # Save Result
+        filename = os.path.basename(img_path)
+        save_name = os.path.splitext(filename)[0] + '.png'
+        save_path = os.path.join(OUTPUT_DIR, save_name)
+        
+        cv2.imwrite(save_path, pred_mask)
+
+    print(f"✅ Done! Results saved to: {OUTPUT_DIR}")
+
+if __name__ == '__main__':
     main()

@@ -1,69 +1,125 @@
 # config.py
 
-import torch
 import os
+import torch
+from datetime import datetime
 
-# --- 1. Device & System ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_WORKERS = 4         # Number of data loading threads
-PIN_MEMORY = True       # Accelerate data transfer to GPU
+class Config:
+    # =========================================================================
+    # 1. Core Task & Dataset Settings
+    # =========================================================================
+    TASK_NAME = 'DIS5K'  # Project Name for logging
+    
+    # [Dataset Paths]
+    # Base root directory
+    BASE_ROOT = "/home/tec/Desktop/Project/Datasets/Matte"
+    
+    # Auto-configure paths for DIS5K (Standard Structure)
+    DATA_ROOT = os.path.join(BASE_ROOT, 'DIS5K')
+    TRAIN_SET = 'DIS-TR'    # Path: DIS5K/DIS-TR/im
+    VAL_SET   = 'DIS-VD'    # Path: DIS5K/DIS-VD/im
+    TEST_SET  = 'DIS-TE1'   
+    
+    # Schema defines folder structure: 'standard' means im/gt
+    SCHEMA    = 'standard'
 
-# --- 2. Model Selection ---
-BACKBONE_OPTIONS = {
-    'tiny':  'swin_tiny_patch4_window7_224',    # [96 dim]
-    'small': 'swin_small_patch4_window7_224',   # [96 dim]
-    'base':  'swin_base_patch4_window7_224',    # [128 dim]
-    'base384': 'swin_base_patch4_window12_384', # [128 dim]
-    'large': 'swin_large_patch4_window12_384'   # [192 dim]
-}
+    # =========================================================================
+    # 2. Model Architecture Components
+    # =========================================================================
+    MODEL_TYPE = 'base'  # Options: 'tiny', 'small', 'base', 'large'
 
-MODEL_SELECT = 'base' 
+    # [Backbone Config]
+    _BACKBONE_CONFIG = {
+        'base': {
+            'name': 'swin_base_patch4_window7_224', 
+            'dim': 128, 
+            'safe_size': 896 
+        },
+        'large': {
+            'name': 'swin_large_patch4_window12_384_in22k', 
+            'dim': 192, 
+            'safe_size': 1152 
+        },
+    }
+    
+    if MODEL_TYPE not in _BACKBONE_CONFIG:
+        raise ValueError(f"❌ Unknown MODEL_TYPE: {MODEL_TYPE}")
 
-if MODEL_SELECT not in BACKBONE_OPTIONS:
-    raise ValueError(f"Invalid model selection: {MODEL_SELECT}")
+    _cfg = _BACKBONE_CONFIG[MODEL_TYPE]
+    BACKBONE_NAME = _cfg['name']
+    EMBED_DIM     = _cfg['dim']       # For Teacher Network
+    SAFE_SIZE     = _cfg['safe_size'] # For Decoupled Strategy
 
-BACKBONE_NAME = BACKBONE_OPTIONS[MODEL_SELECT]
-print(f"🔹 Selected Backbone: {MODEL_SELECT.upper()} ({BACKBONE_NAME})")
+    # [H200 Resolution Strategy]
+    IMG_SIZE = 1024             # Target Output Resolution
+    RESOLUTION_DECOUPLED = True # Resize to SAFE_SIZE for backbone, then restore
 
-# --- 3. Hyperparameters ---
-IMG_SIZE = 1024         # 1024x1024 input
-BATCH_SIZE = 2         # Adjust based on VRAM (8-16 for Base)
-NUM_EPOCHS = 150        # Matting needs more epochs to refine details
-LEARNING_RATE = 1e-4    
-WEIGHT_DECAY = 1e-4     
+    # [Architecture Switches]
+    # 1. Teacher Network (Twin Alignment): Guarantees structural integrity
+    USE_TWIN_ALIGNMENT = True 
+    
+    # 2. Residual Refinement Module (RRM): Cleans up uncertainty halos
+    USE_REFINER = True
 
-# --- 4. Strategy Settings ---
-# [Twin-Swin Strategy]
-USE_TWIN_ALIGNMENT = True  
-DILATE_MASK = False        # [CRITICAL CHANGE] Set to False for fine matting!
+    # =========================================================================
+    # 3. Hardware Optimization (NVIDIA H200 Special)
+    # =========================================================================
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --- 5. Loss Weights (Updated for Ultimate Matting Loss) ---
-# These keys must match the __init__ arguments in utils/loss.py
-LOSS_WEIGHTS = {
-    'weight_struct': 1.0,  # [New] BiRefNet Structure Loss (Core)
-    'weight_l1': 1.0,      # [New] L1 Loss for pixel precision
-    'weight_grad': 1.0,    # [New] Gradient Loss for sharp edges
-    'weight_ssim': 0.5,    # Structure consistency
-    'weight_feat': 0.2     # Feature Alignment
-}
+    # [Memory & Speed]
+    # H200 (141GB) allows massive batch sizes.
+    # We use Batch=32 with Accum=1 for maximum throughput and stable BatchNorm.
+    BATCH_SIZE = 2            
+    GRAD_ACCUM_STEPS = 4       # Effective Batch Size = 32
+    
+    NUM_WORKERS = 16           # High CPU core count for fast data loading
+    PIN_MEMORY = True         
+    USE_AMP = True             # Automatic Mixed Precision (Essential for H200)
 
-# --- 6. Paths ---
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-# DATASET_ROOT = "Datasets/DIS5K_Flat" 
-DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/DIS5K_Flat" 
+    # =========================================================================
+    # 4. Training Hyperparameters
+    # =========================================================================
+    NUM_EPOCHS = 70          
+    LR = 1e-4                 # Initial Learning Rate
+    WEIGHT_DECAY = 1e-4       
 
-TRAIN_ROOT = os.path.join(DATASET_ROOT, 'train') 
-VAL_ROOT = os.path.join(DATASET_ROOT, 'val')     
+    # =========================================================================
+    # 5. Loss Function Weights (Matting Specialized)
+    # =========================================================================
+    # Note: Refiner (RRM) will automatically boost 'grad' weight internally.
+    LOSS_WEIGHTS = {
+        'bce': 0.0,       # Not used for Matting
+        'dice': 0.0,      # Not used to avoid jagged edges
+        'l1': 1.0,        # Pixel-level accuracy
+        'grad': 1.0,      # Gradient Loss (Sharpness base)
+        'ssim': 0.5,      # Structural Similarity (Texture)
+        'feat': 0.2       # Feature Alignment (Student <-> Teacher)
+    }
 
-# --- 7. Logging & Saving ---
-# Updated experiment name to reflect "Matte" instead of "Loc"
-EXPERIMENT_NAME = f"TwinSwin_{MODEL_SELECT.capitalize()}_Matte1024"
+    # =========================================================================
+    # 6. Output Paths & Logging
+    # =========================================================================
+    # Format: YYYYMMDD_HHMM (e.g., 20260202_1430)
+    _timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    # Tag generation for folder name
+    _tag_twin = "Twin" if USE_TWIN_ALIGNMENT else "NoTwin"
+    _tag_refine = "Refined" if USE_REFINER else "Base"
+    
+    CHECKPOINT_DIR = f"./checkpoints/{TASK_NAME}_{MODEL_TYPE}_{IMG_SIZE}_{_tag_twin}_{_tag_refine}_{_timestamp}"
 
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints', EXPERIMENT_NAME)
-LOG_DIR = os.path.join(PROJECT_ROOT, 'logs', EXPERIMENT_NAME)
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
-LAST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'last_model.pth')
+    @staticmethod
+    def print_info():
+        print("\n" + "="*50)
+        print(f"🚀 CONFIGURATION: {Config.TASK_NAME} (H200 Optimized)")
+        print("-" * 50)
+        print(f"   Mode:        Pure Matting (No Dilation)")
+        print(f"   Pipeline:    Twin Alignment [{Config.USE_TWIN_ALIGNMENT}] + RRM [{Config.USE_REFINER}]")
+        print(f"   Model:       {Config.MODEL_TYPE} ({Config.BACKBONE_NAME})")
+        print(f"   Resolution:  {Config.IMG_SIZE} (Safe: {Config.SAFE_SIZE})")
+        print("-" * 50)
+        print(f"   Batch Size:  {Config.BATCH_SIZE} (Accum: {Config.GRAD_ACCUM_STEPS})")
+        print(f"   Num Workers: {Config.NUM_WORKERS}")
+        print(f"   Weights:     {Config.LOSS_WEIGHTS}")
+        print(f"   Save Dir:    {Config.CHECKPOINT_DIR}")
+        print("="*50 + "\n")

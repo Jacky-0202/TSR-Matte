@@ -1,5 +1,6 @@
 torch
 torchvision
+albumentations
 timm
 tqdm
 h5py

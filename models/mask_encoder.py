@@ -1,84 +1,71 @@
 # models/mask_encoder.py
+
 import torch
 import torch.nn as nn
-from models.blocks import DoubleConv
+import torch.nn.functional as F
+from .blocks import DoubleConv
 
-class LayerNorm2d(nn.Module):
+class MaskEncoder(nn.Module):
     """
-    LayerNorm that supports (N, C, H, W) layout directly.
+    Teacher Network: Pure FPN architecture.
+    Extracts high-quality features from masks to guide the Student.
+    Aligned with Student output in both spatial resolution and channel count.
     """
-    def __init__(self, num_channels: int, eps: float = 1e-6):
+    def __init__(self, embed_dim=128):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
-        self.eps = eps
+        # Expected dimensions for Swin-Base alignment: [128, 256, 512, 1024]
+        self.dims = [embed_dim, embed_dim*2, embed_dim*4, embed_dim*8]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None, None] * x + self.bias[:, None, None]
-        return x
-
-class PatchMerging(nn.Module):
-    """
-    Simulates Swin Transformer's Patch Merging (Downsampling).
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.down = nn.Conv2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.norm = LayerNorm2d(out_channels)
-
-    def forward(self, x):
-        x = self.down(x)
-        x = self.norm(x)
-        return x
-
-class SwinMaskEncoder(nn.Module):
-    """
-    Lightweight Teacher Network to extract features from GT Masks.
-    Now supports dynamic embedding dimensions (e.g., 96 for Tiny, 128 for Base).
-    """
-    def __init__(self, embed_dim=96):
-        super().__init__()
-        # Determine channels based on embed_dim
-        # Tiny: 96 -> [96, 192, 384, 768]
-        # Base: 128 -> [128, 256, 512, 1024]
-        
-        self.c0 = embed_dim
-        self.c1 = embed_dim * 2
-        self.c2 = embed_dim * 4
-        self.c3 = embed_dim * 8
-        
-        print(f"🎓 MaskEncoder initialized with dims: [{self.c0}, {self.c1}, {self.c2}, {self.c3}]")
-
-        # Stage 0: 4x Downsample (Stem)
+        # --- 1. Bottom-up Pathway (Encoder) ---
         self.stem = nn.Sequential(
-            nn.Conv2d(1, self.c0, kernel_size=4, stride=4),
-            LayerNorm2d(self.c0)
+            nn.Conv2d(1, self.dims[0], kernel_size=4, stride=4), 
+            nn.GroupNorm(8, self.dims[0]), 
+            nn.GELU()
         )
-        
-        # Stage 1: c0 -> c1 (H/8)
-        self.stage1 = PatchMerging(self.c0, self.c1)
-        
-        # Stage 2: c1 -> c2 (H/16) - Alignment Target 1
-        self.stage2 = PatchMerging(self.c1, self.c2)
-        self.block2 = DoubleConv(self.c2, self.c2) 
-        
-        # Stage 3: c2 -> c3 (H/32) - Alignment Target 2
-        self.stage3 = PatchMerging(self.c2, self.c3)
-        self.block3 = DoubleConv(self.c3, self.c3)
+        # Downsampling stages to match the Student's hierarchy
+        self.down1 = nn.Sequential(
+            nn.Conv2d(self.dims[0], self.dims[1], kernel_size=2, stride=2), 
+            DoubleConv(self.dims[1], self.dims[1])
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(self.dims[1], self.dims[2], kernel_size=2, stride=2), 
+            DoubleConv(self.dims[2], self.dims[2])
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(self.dims[2], self.dims[3], kernel_size=2, stride=2), 
+            DoubleConv(self.dims[3], self.dims[3])
+        )
+
+        # --- 2. Top-down Pathway (FPN Logic) ---
+        # Lateral Connections: Align channels for feature fusion
+        self.lat3_to_2 = nn.Conv2d(self.dims[3], self.dims[2], kernel_size=1) # 1024 -> 512
+        self.lat2_to_1 = nn.Conv2d(self.dims[2], self.dims[1], kernel_size=1) # 512  -> 256
+
+        # Smoothing Layers: Refine fused features and eliminate aliasing
+        self.smooth2 = nn.Conv2d(self.dims[2], self.dims[2], kernel_size=3, padding=1) # H/16, 512ch
+        self.smooth1 = nn.Conv2d(self.dims[1], self.dims[1], kernel_size=3, padding=1) # H/8,  256ch
 
     def forward(self, x):
-        # x: (B, 1, 1024, 1024)
-        x = self.stem(x)   # (B, c0, 256, 256)
-        x = self.stage1(x) # (B, c1, 128, 128)
-        
-        x = self.stage2(x) # (B, c2, 64, 64)
-        f2 = self.block2(x)
-        
-        x = self.stage3(f2) # (B, c3, 32, 32)
-        f3 = self.block3(x)
-        
-        # Return features corresponding to Stage 2 and Stage 3
-        return [f2, f3]
+        """
+        Forward pass returning a list of features aligned with the Student's decoder.
+        Output: [p2 (H/16, 512ch), p1 (H/8, 256ch)]
+        """
+        # --- 1. Bottom-up ---
+        c0 = self.stem(x)   # H/4
+        c1 = self.down1(c0) # H/8
+        c2 = self.down2(c1) # H/16
+        c3 = self.down3(c2) # H/32
+
+        # --- 2. Top-down Fusion ---
+        # Level 1: H/32 -> H/16 fusion
+        p3_lat = self.lat3_to_2(c3)
+        p3_up = F.interpolate(p3_lat, size=c2.shape[-2:], mode='nearest')
+        p2 = self.smooth2(c2 + p3_up) # Refined feature at H/16
+
+        # Level 2: H/16 -> H/8 fusion
+        p2_lat = self.lat2_to_1(p2)
+        p2_up = F.interpolate(p2_lat, size=c1.shape[-2:], mode='nearest')
+        p1 = self.smooth1(c1 + p2_up) # Refined feature at H/8
+
+        # --- 3. Pure Alignment Output ---
+        return [p2, p1] # Matches Student's d1 and d2 perfectly
