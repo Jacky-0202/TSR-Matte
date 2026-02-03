@@ -1,3 +1,5 @@
+# predict.py
+
 import os
 import cv2
 import numpy as np
@@ -5,66 +7,105 @@ import torch
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
+import argparse
 
 # --- Import Project Modules ---
 from config import Config
 from models.twinswinunet import TwinSwinUNet
+from models.refiner import Refiner  # [NEW] Import Refiner for 2nd stage
 
 # ==========================================
 # 🔧 USER CONFIGURATION
 # ==========================================
-CHECKPOINT_PATH = "./checkpoints/TwinSwin_DIS5K_LOCATOR_1024_202601301620/best_model.pth"
-INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/DIS5K/DIS-TE1/im" 
+# Path to your trained .pth file (Ensure this matches Config.IMG_SIZE)
+CHECKPOINT_PATH = "./checkpoints/DIS5K_base_1024_Twin_Refined_20260202_1327/best_model.pth"
+
+# Input: Can be a single image path OR a directory folder
+INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/DIS5K/DIS-TE4/im" 
+
+# Output: Where to save the results
 OUTPUT_DIR = "./results"
 # ==========================================
 
+def parse_args():
+    """Allows overriding paths via command line"""
+    parser = argparse.ArgumentParser(description="TwinSwin-Matte Inference")
+    parser.add_argument('--ckpt', type=str, default=CHECKPOINT_PATH, help='Path to checkpoint')
+    parser.add_argument('--input', type=str, default=INPUT_PATH, help='Input image or folder')
+    parser.add_argument('--output', type=str, default=OUTPUT_DIR, help='Output directory')
+    return parser.parse_args()
+
 def main():
+    args = parse_args()
+    
     # 1. Setup Environment
     device = torch.device(Config.DEVICE)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(args.output, exist_ok=True)
     
-    print(f"🚀 Loading Model: {Config.MODEL_TYPE} ({Config.BACKBONE_NAME})")
-    print(f"   Inference Resolution: {Config.IMG_SIZE}x{Config.IMG_SIZE}")
-    print(f"   Checkpoint: {CHECKPOINT_PATH}")
-    print(f"   Input:      {INPUT_PATH}")
-    print(f"   Output:     {OUTPUT_DIR}")
+    Config.print_info()
+    print(f"🚀 Inference Mode")
+    print(f"   Model:      {Config.MODEL_TYPE}")
+    print(f"   Refiner:    {'ON' if Config.USE_REFINER else 'OFF'}")
+    print(f"   Checkpoint: {args.ckpt}")
+    print(f"   Input:      {args.input}")
+    print(f"   Output:     {args.output}\n")
 
-    # 2. Load Model
+    # 2. Load Models
+    # A. Initialize Student (TwinSwin)
     model = TwinSwinUNet().to(device)
     
-    if not os.path.exists(CHECKPOINT_PATH):
-        raise FileNotFoundError(f"❌ Checkpoint not found at: {CHECKPOINT_PATH}")
+    # B. Initialize Refiner (RRM) if enabled in Config
+    refiner_model = None
+    if Config.USE_REFINER:
+        print("✨ Initializing Refiner Network...")
+        refiner_model = Refiner().to(device)
 
-    # Load Weights (Handle 'state_dict' wrapper if present)
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    # 3. Load Weights
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"❌ Checkpoint not found at: {args.ckpt}")
+
+    print("📦 Loading weights...")
+    checkpoint = torch.load(args.ckpt, map_location=device)
+    
+    # Load Student Weights
     if 'state_dict' in checkpoint:
         model.load_state_dict(checkpoint['state_dict'])
     else:
         model.load_state_dict(checkpoint)
-    
-    model.eval() # Set to evaluation mode (Freeze BN, Dropout)
+    model.eval()
 
-    # 3. Define Preprocessing (Must match Training!)
-    # We resize input to Target Size (1024), model handles Safe Size (896) internally.
+    # Load Refiner Weights (if applicable)
+    if refiner_model is not None:
+        if 'refiner_state_dict' in checkpoint:
+            refiner_model.load_state_dict(checkpoint['refiner_state_dict'])
+            print("✅ Refiner weights loaded successfully.")
+            refiner_model.eval()
+        else:
+            print("⚠️ WARNING: Config.USE_REFINER is True, but checkpoint has no refiner weights!")
+            print("   Running with initialized (random) Refiner weights... Result will be bad.")
+
+    # 4. Define Preprocessing (Must match Training!)
     transform = A.Compose([
         A.Resize(height=Config.IMG_SIZE, width=Config.IMG_SIZE),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ])
 
-    # 4. Prepare File List
-    if os.path.isdir(INPUT_PATH):
-        image_paths = [os.path.join(INPUT_PATH, f) for f in os.listdir(INPUT_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    # 5. Prepare File List
+    if os.path.isdir(args.input):
+        image_paths = [os.path.join(args.input, f) for f in os.listdir(args.input) 
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif'))]
+        image_paths.sort()
     else:
-        image_paths = [INPUT_PATH]
+        image_paths = [args.input]
 
     if not image_paths:
-        print(f"❌ No images found in {INPUT_PATH}")
+        print(f"❌ No images found in {args.input}")
         return
 
-    print(f"📂 Found {len(image_paths)} images. Starting Inference...")
+    print(f"📂 Found {len(image_paths)} images. Processing...")
 
-    # 5. Inference Loop
+    # 6. Inference Loop
     for img_path in tqdm(image_paths):
         # Read Image
         image = cv2.imread(img_path)
@@ -78,19 +119,27 @@ def main():
 
         # Preprocess
         aug = transform(image=image)
-        img_tensor = aug['image'].unsqueeze(0).to(device) # (3, H, W) -> (1, 3, H, W)
+        img_tensor = aug['image'].unsqueeze(0).to(device) # (1, 3, H, W)
 
         # Predict
         with torch.no_grad():
-            # Model returns Sigmoid result (0~1) directly in eval mode
-            pred_tensor = model(img_tensor) 
+            # Step 1: Coarse Prediction (TwinSwin)
+            # In eval mode, TwinSwin returns probability (0~1) directly
+            coarse_prob = model(img_tensor) 
             
+            # Step 2: Refinement (Refiner) - Optional
+            if refiner_model is not None:
+                # Refiner takes (RGB + Coarse Alpha) -> Refined Alpha
+                final_prob = refiner_model(img_tensor, coarse_prob)
+            else:
+                final_prob = coarse_prob
+
             # Post-process
             # (1, 1, H, W) -> (H, W) -> CPU -> Numpy
-            pred_mask = pred_tensor.squeeze().cpu().numpy()
+            pred_mask = final_prob.squeeze().cpu().numpy()
 
-        # Resize back to original image size (Optional but recommended)
-        # Using INTER_LINEAR for smoothness
+        # Resize back to original image size
+        # Using INTER_LINEAR for smoothness (don't use NEAREST for alpha!)
         pred_mask = cv2.resize(pred_mask, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
 
         # Convert to 0-255 image
@@ -99,11 +148,11 @@ def main():
         # Save Result
         filename = os.path.basename(img_path)
         save_name = os.path.splitext(filename)[0] + '.png'
-        save_path = os.path.join(OUTPUT_DIR, save_name)
+        save_path = os.path.join(args.output, save_name)
         
         cv2.imwrite(save_path, pred_mask)
 
-    print(f"✅ Done! Results saved to: {OUTPUT_DIR}")
+    print(f"\n✅ Done! Results saved to: {args.output}")
 
 if __name__ == '__main__':
     main()

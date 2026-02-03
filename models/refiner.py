@@ -4,116 +4,147 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class BasicBlock(nn.Module):
+class DilatedInceptionBlock(nn.Module):
     """
-    Basic Residual Block with Dilation support.
+    Inception-style block with Multi-Scale Dilation.
     
-    This block maintains the spatial resolution (no stride) and channel depth.
-    It uses dilation to expand the receptive field, allowing the network to 
-    observe 'context' (e.g., hair vs. background texture) around the edges 
-    without reducing resolution.
+    Instead of a simple sequential convolution, this block captures context 
+    at multiple scales simultaneously. This is crucial for Matting because 
+    edge uncertainty varies in size (e.g., thin hair vs. wide motion blur).
+    
+    Structure:
+        - Branch 1: 1x1 Conv (Local detail preservation)
+        - Branch 2: 3x3 Conv, Dilation 1 (Standard field of view)
+        - Branch 3: 3x3 Conv, Dilation 2 (Medium field of view)
+        - Branch 4: 3x3 Conv, Dilation 4 (Large field of view for wide halos)
+        - Fusion:   Concatenates all branches and fuses them via 1x1 Conv.
     """
-    def __init__(self, channels, dilation=1):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            channels, channels, 
-            kernel_size=3, stride=1, 
-            padding=dilation, dilation=dilation, 
-            bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.relu = nn.ReLU(inplace=True)
         
-        self.conv2 = nn.Conv2d(
-            channels, channels, 
-            kernel_size=3, stride=1, 
-            padding=1, dilation=1, # Second conv usually keeps dilation=1 to refine features
-            bias=False
+        # We split the output channels among 4 branches to keep parameter count efficient.
+        # e.g., if out_channels=64, each branch outputs 16 channels.
+        branch_channels = out_channels // 4
+        
+        # Branch 1: 1x1 Conv (Pixel-wise transformation, similar to ResNet bottleneck)
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
         )
-        self.bn2 = nn.BatchNorm2d(channels)
+        
+        # Branch 2: 3x3 Conv, Dilation=1 (Standard local context)
+        # Padding=1 ensures spatial resolution is maintained.
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=3, padding=1, dilation=1, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Branch 3: 3x3 Conv, Dilation=2 (Medium context)
+        # Padding=2 ensures spatial resolution is maintained.
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Branch 4: 3x3 Conv, Dilation=4 (Large context)
+        # Crucial for fixing wide halos or "foggy" boundaries.
+        # Padding=4 ensures spatial resolution is maintained.
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(branch_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Fusion Layer: Compresses the concatenated features back to 'out_channels'
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = x
+        # 1. Parallel Processing
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
         
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        # 2. Concatenation (Channel-wise)
+        out = torch.cat([b1, b2, b3, b4], dim=1)
         
-        out = self.conv2(out)
-        out = self.bn2(out)
+        # 3. Fusion
+        out = self.fusion(out)
         
-        # Residual connection: The block learns the "difference" needed
-        out += identity
-        out = self.relu(out)
+        # 4. Residual Connection
+        # Input 'x' is added to the output, allowing the network to learn 
+        # only the "difference" (residual) needed to improve the features.
+        out += x
         
-        return out
+        return self.relu(out)
 
 class Refiner(nn.Module):
     """
-    Residual Refinement Module (RRM).
+    Residual Refinement Module (RRM) with Inception Architecture.
     
     Purpose:
         Takes the high-resolution RGB image and the 'Coarse Alpha' from the 
-        TwinSwin backbone, and predicts a 'Residual Map' to correct errors 
-        (mainly halos and fuzzy boundaries).
+        TwinSwin backbone, and predicts a 'Residual Map' to correct errors.
         
-    Architecture:
-        - Input: 4 Channels (3 RGB + 1 Coarse Alpha)
-        - Body: A series of Residual Blocks with varying dilation rates.
-        - Output: 1 Channel (Refined Alpha)
-        - Operation: Final_Alpha = Sigmoid(Coarse_Alpha + Predicted_Residual)
+    Mechanism:
+        Final_Alpha = Sigmoid( Coarse_Alpha + Residual_Delta )
     """
     def __init__(self, in_channels=4, mid_channels=64):
         super().__init__()
         
-        # 1. Feature Extraction
-        # Projects the 4-channel input into a higher-dimensional feature space.
+        # 1. Feature Extraction (Entry)
+        # Combines RGB (3) + Coarse Alpha (1) -> High dimensional feature space
         self.conv_in = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True)
         )
         
-        # 2. Refinement Body (Bottleneck)
-        # We use a sequence of blocks with different dilation rates to capture
-        # multi-scale context information (useful for different hair thicknesses).
+        # 2. Refinement Body (Inception Blocks)
+        # We stack 2 blocks to allow complex feature refinement.
+        # Thanks to Dilation=4, the Receptive Field is large enough to see entire hair strands.
         self.body = nn.Sequential(
-            BasicBlock(mid_channels, dilation=1),
-            BasicBlock(mid_channels, dilation=2), # Look further for texture context
-            BasicBlock(mid_channels, dilation=1)
+            DilatedInceptionBlock(mid_channels, mid_channels),
+            DilatedInceptionBlock(mid_channels, mid_channels)
         )
         
         # 3. Residual Prediction Head
-        # Compresses features back to 1 channel (the correction map).
-        # We do NOT use ReLU or Sigmoid here because the residual can be negative 
-        # (to suppress halos) or positive (to fill holes).
+        # Collapses features to 1 channel (the correction map).
+        # Note: No Activation (ReLU/Sigmoid) here. We need raw logits 
+        # because the correction can be positive (add opacity) or negative (remove halo).
         self.conv_out = nn.Conv2d(mid_channels, 1, kernel_size=3, padding=1, bias=True)
 
     def forward(self, img, coarse_alpha):
         """
         Args:
-            img: [B, 3, H, W] - The original high-resolution RGB image.
-            coarse_alpha: [B, 1, H, W] - The alpha prediction from TwinSwin (0~1 range).
+            img: [B, 3, H, W] - Original RGB image.
+            coarse_alpha: [B, 1, H, W] - Initial prediction from TwinSwin (0~1).
         
         Returns:
-            refined_alpha: [B, 1, H, W] - The final corrected alpha matte.
+            refined_alpha: [B, 1, H, W] - Final alpha matte (0~1).
         """
-        # Concatenate RGB and Coarse Alpha along the channel dimension
-        # Input shape becomes [B, 4, H, W]
+        # Concatenate inputs along channel dimension
         x = torch.cat([img, coarse_alpha], dim=1)
         
-        # Extract features
+        # Extract basic features
         x = self.conv_in(x)
         
-        # Pass through residual blocks
+        # Apply Multi-Scale Refinement
         x = self.body(x)
         
-        # Predict the residual (correction map)
-        # This map contains values like +0.1 (add opacity) or -0.2 (remove halo)
+        # Predict the residual (Delta)
         residual = self.conv_out(x)
         
-        # Apply the correction: Coarse + Residual
-        # Use Sigmoid to ensure the final output is strictly between 0 and 1
+        # Apply Correction: Coarse + Delta
+        # Sigmoid ensures the result stays strictly within [0, 1]
         refined_alpha = torch.sigmoid(coarse_alpha + residual)
         
         return refined_alpha
