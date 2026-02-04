@@ -99,6 +99,15 @@ python eval.py
 ```
 
 ---
+### 📦 Model Zoo & Checkpoints
+
+| Model | Version | Resolution | SAD (HRS10K) | Size | Download |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TSR-Matte** | v1.0 | 1024x1024 | **24.3** | 190 MB | [**Link**](https://github.com/Jacky-0202/TSR-Matte/releases/download/v1.0/inference_model_fp16.pth) |
+
+> *Note: Pre-trained on DIS5K + HRS10K. Optimized for FP16 inference.*
+
+---
 ### 📜 References
 
 This project is built upon the insights and architectures of the following excellent works:
