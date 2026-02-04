@@ -12,16 +12,16 @@ import argparse
 # --- Import Project Modules ---
 from config import Config
 from models.twinswinunet import TwinSwinUNet
-from models.refiner import Refiner  # [NEW] Import Refiner for 2nd stage
+from models.refiner import Refiner
 
 # ==========================================
 # 🔧 USER CONFIGURATION
 # ==========================================
 # Path to your trained .pth file (Ensure this matches Config.IMG_SIZE)
-CHECKPOINT_PATH = "./checkpoints/DIS5K_base_1024_Twin_Refined_20260202_1327/best_model.pth"
+CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/inference_model_fp16.pth"
 
 # Input: Can be a single image path OR a directory folder
-INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/DIS5K/DIS-TE4/im" 
+INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/HRS10K/TE-HRS10K/im" 
 
 # Output: Where to save the results
 OUTPUT_DIR = "./results"
@@ -72,6 +72,9 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
     else:
         model.load_state_dict(checkpoint)
+    
+    # [Optim] Convert to FP16 for speed
+    model.half()
     model.eval()
 
     # Load Refiner Weights (if applicable)
@@ -79,6 +82,7 @@ def main():
         if 'refiner_state_dict' in checkpoint:
             refiner_model.load_state_dict(checkpoint['refiner_state_dict'])
             print("✅ Refiner weights loaded successfully.")
+            refiner_model.half()
             refiner_model.eval()
         else:
             print("⚠️ WARNING: Config.USE_REFINER is True, but checkpoint has no refiner weights!")
@@ -120,26 +124,26 @@ def main():
         # Preprocess
         aug = transform(image=image)
         img_tensor = aug['image'].unsqueeze(0).to(device) # (1, 3, H, W)
+        
+        # [Optim] Input must be FP16 to match model
+        img_tensor = img_tensor.half()
 
         # Predict
         with torch.no_grad():
             # Step 1: Coarse Prediction (TwinSwin)
-            # In eval mode, TwinSwin returns probability (0~1) directly
             coarse_prob = model(img_tensor) 
             
             # Step 2: Refinement (Refiner) - Optional
             if refiner_model is not None:
-                # Refiner takes (RGB + Coarse Alpha) -> Refined Alpha
                 final_prob = refiner_model(img_tensor, coarse_prob)
             else:
                 final_prob = coarse_prob
 
             # Post-process
-            # (1, 1, H, W) -> (H, W) -> CPU -> Numpy
-            pred_mask = final_prob.squeeze().cpu().numpy()
+            # [FIX] Convert to float32 BEFORE numpy conversion to avoid OpenCV errors
+            pred_mask = final_prob.squeeze().float().cpu().numpy()
 
         # Resize back to original image size
-        # Using INTER_LINEAR for smoothness (don't use NEAREST for alpha!)
         pred_mask = cv2.resize(pred_mask, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
 
         # Convert to 0-255 image

@@ -80,8 +80,22 @@ python eval.py
 4. Inference
 Run prediction on single images or a directory:
 
+- ⚠️ Note on Performance: 
+This model is optimized for Half Precision (FP16) inference. Running in FP32 may result in slower speeds and slightly higher VRAM usage without significant quality gains. The provided scripts (eval.py, predict.py) automatically handle FP16 conversion.
+pls use:
+
+```bash
+export_inference.py
+```
+
 ```bash
 python predict.py
+```
+
+- To evaluate on benchmarks (DIS-TE1, HRS10K):
+
+```bash
+python eval.py
 ```
 
 ---

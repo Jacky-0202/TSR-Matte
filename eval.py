@@ -1,116 +1,221 @@
 # eval.py
 
 import os
-import torch
-import torch.nn.functional as F
-import numpy as np
 import cv2
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
+import sys
+import argparse
 
 # --- Import Project Modules ---
+sys.path.append(os.getcwd())
 from config import Config
 from models.twinswinunet import TwinSwinUNet
-from utils.dataset import MattingDataset
-from utils.metrics import calculate_matting_metrics
+from models.refiner import Refiner
 
-def evaluate():
-    # 1. Setup Device
-    device = torch.device(Config.DEVICE)
+# ==========================================
+# 🔧 USER CONFIGURATION
+# ==========================================
+DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/Matte"
+CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/inference_model_fp16.pth"
+
+# Performance Settings
+BATCH_SIZE = 8      # H200 can handle 16, 32, or even 64.
+NUM_WORKERS = 8      # CPU threads for data loading.
+
+TEST_SETS = [
+    {
+        'name': 'DIS-TE1',
+        'img_dir': os.path.join(DATASET_ROOT, 'DIS5K/DIS-TE1/im'),
+        'gt_dir':  os.path.join(DATASET_ROOT, 'DIS5K/DIS-TE1/gt')
+    },
+    {
+        'name': 'HRS10K',
+        'img_dir': os.path.join(DATASET_ROOT, 'HRS10K/TE-HRS10K/im'), 
+        'gt_dir':  os.path.join(DATASET_ROOT, 'HRS10K/TE-HRS10K/gt') 
+    }
+]
+# ==========================================
+
+class MattingMetric:
+    """Accumulates metrics (SAD, MSE)"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.sad_sum_list = [] # Sum of Absolute Differences (Academic Standard)
+        self.mae_list = []     # Mean Absolute Error (For Quick Check)
+        self.mse_list = []     # Mean Squared Error
+
+    def update(self, pred, gt):
+        # Normalize to 0-1
+        p = pred.astype(np.float32) / 255.0
+        g = gt.astype(np.float32) / 255.0
+        
+        # Calculate metrics on the ORIGINAL resolution
+        abs_diff = np.abs(p - g)
+        
+        self.sad_sum_list.append(np.sum(abs_diff))
+        self.mae_list.append(np.mean(abs_diff))
+        self.mse_list.append(np.mean((p - g) ** 2))
+
+    def get_results(self):
+        if not self.sad_sum_list: return None
+        return {
+            'SAD_SUM': np.mean(self.sad_sum_list),
+            'MAE': np.mean(self.mae_list),
+            'SAD_1k': np.mean(self.mae_list) * 1000, # Matches Training Log
+            'MSE': np.mean(self.mse_list),
+            'Count': len(self.sad_sum_list)
+        }
+
+class EvalDataset(Dataset):
+    """
+    Custom Dataset for Batch Evaluation.
+    We do NOT load GT here to save RAM. We only load GT when calculating metrics.
+    """
+    def __init__(self, img_dir, gt_dir, img_size=1024):
+        self.img_dir = img_dir
+        self.gt_dir = gt_dir
+        self.img_size = img_size
+        
+        self.img_names = [f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+        
+        # Preprocessing (Resize to Model Input Size)
+        self.transform = A.Compose([
+            A.Resize(height=img_size, width=img_size),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+    def __len__(self):
+        return len(self.img_names)
+
+    def __getitem__(self, idx):
+        img_name = self.img_names[idx]
+        img_path = os.path.join(self.img_dir, img_name)
+        
+        # Find GT Path (Handle extension mismatch)
+        gt_name = os.path.splitext(img_name)[0] + '.png'
+        gt_path = os.path.join(self.gt_dir, gt_name)
+        if not os.path.exists(gt_path):
+             gt_path = os.path.join(self.gt_dir, img_name)
+
+        # Load Image
+        image = cv2.imread(img_path)
+        if image is None:
+            # Return dummy if corrupt
+            return torch.zeros(3, self.img_size, self.img_size), "", ""
+
+        # Preprocess
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        aug = self.transform(image=image_rgb)
+        img_tensor = aug['image']
+
+        # Return: Tensor, GT Path (string), Image Name (string)
+        return img_tensor, gt_path, img_name
+
+def evaluate_dataset(model, refiner, dataset_cfg, device):
+    print(f"\n📊 Evaluating: {dataset_cfg['name']} (Batch Size: {BATCH_SIZE})")
     
-    # 2. Setup Paths (Automatically uses TEST_SET from Config)
-    test_root = os.path.join(Config.DATA_ROOT, Config.TEST_SET)
-    checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+    # 1. Setup Dataset & DataLoader
+    if not os.path.exists(dataset_cfg['img_dir']):
+        print(f"Skipping {dataset_cfg['name']} (Path not found)")
+        return None
+
+    dataset = EvalDataset(dataset_cfg['img_dir'], dataset_cfg['gt_dir'], Config.IMG_SIZE)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=NUM_WORKERS,
+        pin_memory=True
+    )
+
+    metric = MattingMetric()
     
-    print("\n" + "="*50)
-    print(f"🔍 EVALUATION REPORT: {Config.TASK_NAME}")
-    print(f"   Target Resolution: {Config.IMG_SIZE}")
-    print(f"   Test Set Path:    {test_root}")
-    print(f"   Checkpoint:       {checkpoint_path}")
-    print("="*50)
-
-    if not os.path.exists(checkpoint_path):
-        print(f"❌ Error: Checkpoint not found at {checkpoint_path}")
-        return
-
-    # 3. Initialize Model
-    model = TwinSwinUNet().to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['state_dict'])
+    # 2. Batch Inference Loop
     model.eval()
-    print(f"✅ Model loaded. Best SAD recorded: {checkpoint.get('best_sad', 'N/A'):.4f}")
-
-    # 4. Initialize Test Dataset
-    # Note: Target size matches training to ensure consistency
-    dataset = MattingDataset(
-        root_dir=test_root,
-        mode='val', # Uses 'val' mode logic (Resize + Normalize)
-        target_size=Config.IMG_SIZE,
-        schema=Config.SCHEMA
-    )
+    if refiner: refiner.eval()
     
-    # We use batch_size=1 for precise metric calculation
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=4
-    )
+    pbar = tqdm(dataloader, total=len(dataloader), bar_format='{l_bar}{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}')
     
-    print(f"📊 Processing {len(dataset)} images...")
-
-    # 5. Metrics Accumulators
-    total_sad = 0
-    total_mse = 0
-    total_grad = 0
-    total_acc = 0
-    total_mae = 0 # Mean Absolute Error (L1)
-    
-    # 6. Evaluation Loop
     with torch.no_grad():
-        for images, masks in tqdm(data_loader, desc="Testing"):
-            images = images.to(device)
-            masks = masks.to(device)
+        for batch_imgs, batch_gt_paths, _ in pbar:
+            # Move to GPU & FP16
+            batch_imgs = batch_imgs.to(device).half()
             
-            # Inference (Returns Sigmoid output in eval mode)
-            pred = model(images)
+            # Forward Pass
+            coarse_prob = model(batch_imgs)
+            if refiner:
+                final_prob = refiner(batch_imgs, coarse_prob)
+            else:
+                final_prob = coarse_prob
             
-            # Calculate standard metrics
-            mse, sad, grad, acc = calculate_matting_metrics(pred, masks)
-            mae = F.l1_loss(pred, masks).item()
+            # Convert to Numpy (Batch, 1, H, W) -> (Batch, H, W)
+            preds = final_prob.squeeze(1).float().cpu().numpy()
             
-            total_sad += sad
-            total_mse += mse
-            total_grad += grad
-            total_acc += acc
-            total_mae += mae
+            # 3. Post-process & Calculate Metrics (Iterate inside batch)
+            for i in range(len(preds)):
+                pred_mask = preds[i]
+                gt_path = batch_gt_paths[i]
+                
+                if not os.path.exists(gt_path): continue
+                
+                # Load GT to get Original Size
+                gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+                if gt is None: continue
+                
+                orig_h, orig_w = gt.shape[:2]
+                
+                # Resize Prediction back to Original Resolution
+                pred_mask_resized = cv2.resize(pred_mask, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                pred_255 = (pred_mask_resized * 255).astype(np.uint8)
+                
+                # Update Metrics
+                metric.update(pred_255, gt)
 
-    # 7. Aggregate Scores
-    num_samples = len(dataset)
-    avg_sad = total_sad / num_samples
-    avg_mse = (total_mse / num_samples) * 1000 # Scaling MSE for readability
-    avg_grad = total_grad / num_samples
-    avg_acc = total_acc / num_samples
-    avg_mae = total_mae / num_samples
+            # Update Progress Bar
+            current_res = metric.get_results()
+            if current_res:
+                pbar.set_postfix(mae=f"{current_res['MAE']:.4f}", log_sad=f"{current_res['SAD_1k']:.1f}")
 
-    # 8. Print Results
-    print("\n" + "✨ FINAL TEST RESULTS " + "✨")
-    print("-" * 30)
-    print(f"🏆 Average SAD:   {avg_sad:.4f}")
-    print(f"🏆 Average MSE:   {avg_mse:.4f} (x10^-3)")
-    print(f"🏆 Average MAE:   {avg_mae:.6f}")
-    print(f"🏆 Average Grad:  {avg_grad:.4f}")
-    print(f"🏆 Average Acc:   {avg_acc:.2f}%")
-    print("-" * 30)
+    return metric.get_results()
+
+def main():
+    device = torch.device(Config.DEVICE)
+    print(f"🚀 High-Speed Evaluation | Device: {device} | FP16: On")
     
-    # Save results to a text file
-    result_file = os.path.join(Config.CHECKPOINT_DIR, f"test_results_{Config.TEST_SET}.txt")
-    with open(result_file, "w") as f:
-        f.write(f"Task: {Config.TASK_NAME}\n")
-        f.write(f"Test Set: {Config.TEST_SET}\n")
-        f.write(f"SAD: {avg_sad:.4f}\n")
-        f.write(f"MSE: {avg_mse:.4f}\n")
-        f.write(f"MAE: {avg_mae:.6f}\n")
-        f.write(f"Grad: {avg_grad:.4f}\n")
-        f.write(f"Accuracy: {avg_acc:.2f}%\n")
+    # 1. Load Models
+    print("📦 Loading Models...")
+    model = TwinSwinUNet().to(device)
+    refiner = Refiner().to(device) if Config.USE_REFINER else None
     
-    print(f"📄 Full report saved to: {result_file}")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    if 'state_dict' in checkpoint: model.load_state_dict(checkpoint['state_dict'])
+    else: model.load_state_dict(checkpoint)
+    model.half()
+    
+    if refiner and 'refiner_state_dict' in checkpoint:
+        refiner.load_state_dict(checkpoint['refiner_state_dict'])
+        refiner.half()
 
-if __name__ == "__main__":
-    evaluate()
+    # 2. Run Evaluation
+    print("\n" + "="*85)
+    print(f"{'Dataset':<10} | {'MAE':<8} | {'Log_SAD':<8} | {'Real_SAD (Sum)':<15} | {'MSE (1e-3)':<10}")
+    print(f"{'(Name)':<10} | {'(0-1)':<8} | {'(MAE*1k)':<8} | {'(Academic)':<15} | {'(Stability)':<10}")
+    print("-" * 85)
+    
+    for ds_cfg in TEST_SETS:
+        res = evaluate_dataset(model, refiner, ds_cfg, device)
+        if res:
+            print(f"{ds_cfg['name']:<10} | {res['MAE']:<8.4f} | {res['SAD_1k']:<8.1f} | {res['SAD_SUM']:<15.1f} | {res['MSE']*1000:<10.2f}")
+
+    print("="*85 + "\n")
+
+if __name__ == '__main__':
+    main()
