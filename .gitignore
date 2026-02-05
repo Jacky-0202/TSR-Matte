@@ -16,6 +16,7 @@ checkpoints/
 
 # 測試結果 (讓使用者自己跑 predict.py 產生)
 results/
+combines/
 
 # 系統檔案
 .DS_Store

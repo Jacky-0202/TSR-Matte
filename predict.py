@@ -18,13 +18,14 @@ from models.refiner import Refiner
 # 🔧 USER CONFIGURATION
 # ==========================================
 # Path to your trained .pth file (Ensure this matches Config.IMG_SIZE)
-CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/inference_model_fp16.pth"
+CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/tsr_general_fp16.pth"
 
 # Input: Can be a single image path OR a directory folder
 INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/HRS10K/TE-HRS10K/im" 
 
 # Output: Where to save the results
 OUTPUT_DIR = "./results"
+
 # ==========================================
 
 def parse_args():

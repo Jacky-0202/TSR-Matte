@@ -19,7 +19,7 @@ from models.refiner import Refiner
 SOURCE_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/best_model.pth"
 
 # Path for the output lightweight inference model
-OUTPUT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/inference_model_fp16.pth"
+OUTPUT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/tsr_general_fp16.pth"
 # ==========================================
 
 def main():

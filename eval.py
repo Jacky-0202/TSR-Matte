@@ -21,7 +21,7 @@ from models.refiner import Refiner
 # 🔧 USER CONFIGURATION
 # ==========================================
 DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/Matte"
-CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/inference_model_fp16.pth"
+CHECKPOINT_PATH = "./checkpoints/General_base_1024_Twin_Refined_20260203_2349/tsr_general_fp16.pth"
 
 # Performance Settings
 BATCH_SIZE = 8      # H200 can handle 16, 32, or even 64.

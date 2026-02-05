@@ -94,9 +94,9 @@ python predict.py
 ---
 ### 📦 Model Zoo & Checkpoints
 
-| Model | Version | Resolution | SAD (HRS10K) | Size | Download |
+| Model | Backbone | Resolution | SAD (HRS10K) | Size | Download |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **TSR-Matte** | v1.0 | 1024x1024 | **24.3** | 190 MB | [**Link**](https://github.com/Jacky-0202/TSR-Matte/releases/download/untagged-b9176d651e2ffc17247a/tsr_general_fp16.pth) |
+| **TSR-Matte** | BASE | 1024x1024 | **24.3** | 200 MB | [**Link**](https://github.com/Jacky-0202/TSR-Matte/releases/download/untagged-c096e155cc8c09ebc29e/tsr_general_fp16.pth) |
 
 > *Note: Pre-trained on DIS5K + HRS10K. Optimized for FP16 inference.*
 
